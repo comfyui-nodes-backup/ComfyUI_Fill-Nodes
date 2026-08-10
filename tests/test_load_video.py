@@ -233,10 +233,16 @@ class LoadVideoExecutionTests(unittest.TestCase):
                 mock.patch.object(load_video, "_check_memory"),
                 mock.patch.object(load_video.InputImpl, "VideoFromFile", return_value=source) as create_source,
                 mock.patch.object(load_video.InputImpl, "VideoFromComponents", return_value=native_video) as create_video,
+                mock.patch.object(load_video, "ProgressBar") as progress_type,
             ):
                 result = load_video.FL_LoadVideo().load_video("nested/clip.mp4", json.dumps(configured))
 
         create_source.assert_called_once_with(str(path.resolve()), start_time=0, duration=4 / 30)
+        progress_type.assert_called_once_with(5)
+        self.assertEqual(
+            [call.args[0] for call in progress_type.return_value.update_absolute.call_args_list],
+            [0, 1, 2, 3, 4, 5],
+        )
         loaded_images, loaded_audio, returned_video, fps, frame_count = result["result"]
         self.assertEqual(loaded_images.shape, (2, 2, 2, 3))
         self.assertEqual(loaded_audio["waveform"].shape[-1], 6400)
@@ -292,6 +298,7 @@ class LoadVideoFrontendTests(unittest.TestCase):
             'this.updateSetting("start_time"',
             'this.updateSetting("end_time"',
             'data-role="trim-frame-label"',
+            'data-role="progress"',
             'selected frames',
             'syncFrameRange(name)',
             'effectiveFrameRate()',
@@ -305,11 +312,19 @@ class LoadVideoFrontendTests(unittest.TestCase):
             "/fl/load-video/info?",
             'api.apiURL(`/view?',
             'message?.fl_load_video?.[0]',
+            'LOAD_PROGRESS_PHASES',
+            'beginTransientProgress("uploading")',
+            'beginTransientProgress("probing")',
+            'api.addEventListener("progress"',
+            'api.addEventListener("execution_cached"',
+            'api.addEventListener("execution_interrupted"',
             'MIN_NODE_WIDTH = 420',
             'MIN_NODE_HEIGHT = 440',
         ):
             with self.subTest(behavior=behavior):
                 self.assertIn(behavior, script)
+
+        self.assertNotIn("flvl-upload-progress", script)
 
         menu_index = script.index('<div class="flvl-menu" data-role="settings-menu"')
         for visible_control in (

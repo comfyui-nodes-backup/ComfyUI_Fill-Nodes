@@ -215,6 +215,7 @@ class VideoCombineExecutionTests(unittest.TestCase):
             ) as save_path,
             mock.patch.object(video_combine.InputImpl, "VideoFromComponents", return_value=native_video) as create_video,
             mock.patch.object(video_combine.args, "disable_metadata", False),
+            mock.patch.object(video_combine, "ProgressBar") as progress_type,
         ):
             result = video_combine.FL_VideoCombine().combine_video(
                 images,
@@ -225,6 +226,11 @@ class VideoCombineExecutionTests(unittest.TestCase):
             )
 
         save_path.assert_called_once_with("clips/test", "D:\\temp", 8, 6)
+        progress_type.assert_called_once_with(3)
+        self.assertEqual(
+            [call.args[0] for call in progress_type.return_value.update_absolute.call_args_list],
+            [0, 1, 2, 3],
+        )
         components = create_video.call_args.args[0]
         self.assertEqual(components.images.shape, (3, 6, 8, 3))
         self.assertEqual(float(components.frame_rate), 12.0)
@@ -306,6 +312,7 @@ class VideoCombineFrontendTests(unittest.TestCase):
 
         for behavior in (
             'data-role="sync"',
+            'data-role="progress"',
             "synchronizeVideoCombinePreviews()",
             "prepareForSynchronization()",
             "this.video.currentTime = 0",
@@ -314,6 +321,11 @@ class VideoCombineFrontendTests(unittest.TestCase):
             'document.addEventListener("visibilitychange"',
             'window.addEventListener("pagehide"',
             "pauseAllVideoCombinePreviews()",
+            "COMBINE_PROGRESS_PHASES",
+            'beginTransientProgress("loading preview")',
+            'api.addEventListener("progress"',
+            'api.addEventListener("execution_cached"',
+            'api.addEventListener("execution_interrupted"',
         ):
             with self.subTest(behavior=behavior):
                 self.assertIn(behavior, script)
