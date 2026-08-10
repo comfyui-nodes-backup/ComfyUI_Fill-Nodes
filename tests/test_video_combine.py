@@ -362,6 +362,7 @@ class VideoCombineFrontendTests(unittest.TestCase):
 
         for behavior in (
             'data-role="sync"',
+            'data-role="progress"',
             "syncVideoCombinePreviews()",
             "prepareForSynchronization()",
             "this.video.currentTime = 0",
@@ -370,6 +371,11 @@ class VideoCombineFrontendTests(unittest.TestCase):
             'document.addEventListener("visibilitychange"',
             'window.addEventListener("pagehide"',
             "pauseAllVideoCombinePreviews()",
+            "COMBINE_PROGRESS_LABEL",
+            'beginTransientProgress("loading preview")',
+            'api.addEventListener("progress"',
+            'api.addEventListener("execution_cached"',
+            'api.addEventListener("execution_interrupted"',
         ):
             with self.subTest(behavior=behavior):
                 self.assertIn(behavior, script)

@@ -20,6 +20,17 @@ const DEFAULT_SETTINGS = {
 const MIN_NODE_WIDTH = 420;
 const MIN_NODE_HEIGHT = 360;
 const MIN_PANEL_HEIGHT = 280;
+const COMBINE_PROGRESS_LABEL = "encoding MP4";
+const videoCombinePanelsByNode = new Map();
+
+function nodeKey(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function eventNode(detail) {
+  if (detail && typeof detail === "object") return detail.node ?? detail.node_id;
+  return detail;
+}
 
 const STYLES = `
   .flvc-panel {
@@ -220,7 +231,52 @@ const STYLES = `
   }
   .flvc-status[data-state="ready"] { background: rgba(18, 59, 43, .9); color: #86efac; }
   .flvc-status[data-state="stale"] { background: rgba(70, 55, 24, .9); color: #fde68a; }
+  .flvc-status[data-state="busy"] { background: rgba(49, 46, 129, .9); color: #c4b5fd; }
   .flvc-status[data-state="error"] { background: rgba(76, 29, 36, .9); color: #fda4af; }
+  .flvc-progress {
+    background: rgba(23, 24, 29, .9);
+    border: 1px solid rgba(255, 255, 255, .09);
+    border-radius: 999px;
+    bottom: 38px;
+    height: 7px;
+    left: 7px;
+    overflow: hidden;
+    position: absolute;
+    right: 7px;
+    z-index: 4;
+  }
+  .flvc-progress[hidden] { display: none; }
+  .flvc-progress-fill {
+    background: linear-gradient(90deg, #7c3aed, #a78bfa);
+    display: block;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+    transition: width 160ms ease;
+    width: 0;
+  }
+  .flvc-progress[data-state="active"] .flvc-progress-fill::after {
+    animation: flvc-progress-sheen 1s linear infinite;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .5), transparent);
+    content: "";
+    inset: 0;
+    position: absolute;
+    transform: translateX(-100%);
+  }
+  .flvc-progress[data-indeterminate="true"] .flvc-progress-fill {
+    animation: flvc-progress-slide 1s ease-in-out infinite alternate;
+    transition: none;
+    width: 42% !important;
+  }
+  .flvc-progress[data-state="complete"] .flvc-progress-fill { background: #22c55e; }
+  .flvc-progress[data-state="error"] .flvc-progress-fill { background: #ef4444; }
+  @keyframes flvc-progress-sheen {
+    to { transform: translateX(100%); }
+  }
+  @keyframes flvc-progress-slide {
+    from { transform: translateX(-20%); }
+    to { transform: translateX(140%); }
+  }
   .flvc-preview-controls {
     align-items: center;
     background: linear-gradient(transparent, rgba(0, 0, 0, .82) 55%);
@@ -488,6 +544,10 @@ class VideoCombinePanel {
     this.handleDocumentKeyDown = null;
     this.playbackRequested = false;
     this.restartAtStart = false;
+    this.executionActive = false;
+    this.progressToken = 0;
+    this.progressHideTimer = null;
+    this.previewLoadToken = null;
 
     this.node.properties ||= {};
     if (!Number.isFinite(this.node.properties.previewVolume)) {
@@ -572,6 +632,9 @@ class VideoCombinePanel {
           <div class="flvc-placeholder" data-role="placeholder">Queue the workflow to render a preview.</div>
           <div class="flvc-summary" data-role="summary">MP4 · H.264</div>
           <div class="flvc-status" data-role="status" data-state="idle">not rendered</div>
+          <div class="flvc-progress" data-role="progress" data-state="active" data-indeterminate="false" role="progressbar" hidden>
+            <span class="flvc-progress-fill" data-role="progress-fill"></span>
+          </div>
           <div class="flvc-preview-controls">
             <button class="flvc-icon-button" data-role="play" type="button" title="Play or pause preview">▶</button>
             <span class="flvc-time" data-role="time">00:00 / 00:00</span>
@@ -625,6 +688,8 @@ class VideoCombinePanel {
     this.status = this.container.querySelector('[data-role="status"]');
     this.error = this.container.querySelector('[data-role="error"]');
     this.summary = this.container.querySelector('[data-role="summary"]');
+    this.progress = this.container.querySelector('[data-role="progress"]');
+    this.progressFill = this.container.querySelector('[data-role="progress-fill"]');
     this.playButton = this.container.querySelector('[data-role="play"]');
     this.previewMuteButton = this.container.querySelector('[data-role="preview-mute"]');
     this.previewVolume = this.container.querySelector('[data-role="preview-volume"]');
@@ -713,11 +778,13 @@ class VideoCombinePanel {
       }
       this.placeholder.style.display = "none";
       this.updateTime();
+      this.finishTransientProgress(this.previewLoadToken, "ready");
     });
     this.video.addEventListener("error", () => {
       if (!this.video.src) return;
       this.placeholder.textContent = "Preview unavailable. The rendered file may still be valid.";
       this.placeholder.style.display = "flex";
+      this.failTransientProgress(this.previewLoadToken, "preview failed");
     });
 
     this.previewMuteButton.addEventListener("click", () => {
@@ -854,6 +921,93 @@ class VideoCombinePanel {
     this.status.textContent = label;
   }
 
+  showProgress(value, max, label, state = "active", indeterminate = false) {
+    if (this.progressHideTimer !== null) {
+      clearTimeout(this.progressHideTimer);
+      this.progressHideTimer = null;
+    }
+    const total = Math.max(1, Number(max) || 1);
+    const current = Math.max(0, Math.min(total, Number(value) || 0));
+    this.progress.hidden = false;
+    this.progress.dataset.state = state;
+    this.progress.dataset.indeterminate = String(indeterminate);
+    this.progress.setAttribute("aria-valuemin", "0");
+    this.progress.setAttribute("aria-valuemax", String(total));
+    this.progress.setAttribute("aria-valuenow", String(current));
+    this.progressFill.style.width = `${current / total * 100}%`;
+    if (state === "error") this.setStatus("error", label);
+    else if (state === "complete") this.setStatus("ready", label);
+    else this.setStatus("busy", label);
+  }
+
+  hideProgress() {
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
+    this.progressHideTimer = null;
+    this.progress.hidden = true;
+    this.progressFill.style.width = "0%";
+  }
+
+  scheduleProgressHide() {
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
+    this.progressHideTimer = window.setTimeout(() => {
+      this.progress.hidden = true;
+      this.progressHideTimer = null;
+    }, 900);
+  }
+
+  beginTransientProgress(label) {
+    const token = ++this.progressToken;
+    if (!this.executionActive) this.showProgress(0, 1, label, "active", true);
+    return token;
+  }
+
+  finishTransientProgress(token, label = "ready") {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(1, 1, label, "complete");
+    this.scheduleProgressHide();
+  }
+
+  failTransientProgress(token, label) {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(1, 1, label, "error");
+  }
+
+  beginExecution() {
+    this.progressToken += 1;
+    this.executionActive = true;
+    this.showProgress(0, 1, "preparing", "active", true);
+  }
+
+  updateExecutionProgress(value, max) {
+    this.executionActive = true;
+    const total = Math.max(1, Number(max) || 1);
+    const current = Math.max(0, Math.min(total, Number(value) || 0));
+    if (current >= total) {
+      this.finishExecution("rendered");
+      return;
+    }
+    const frameTotal = Math.max(1, total - 1);
+    const label = current > 0 ? `encoding ${Math.min(current, frameTotal)}/${frameTotal}` : COMBINE_PROGRESS_LABEL;
+    this.showProgress(current, total, label, "active");
+  }
+
+  finishExecution(label) {
+    this.executionActive = false;
+    this.progressToken += 1;
+    this.showProgress(1, 1, label, "complete");
+    this.scheduleProgressHide();
+  }
+
+  failProgress(label) {
+    this.executionActive = false;
+    this.progressToken += 1;
+    this.showProgress(1, 1, label, "error");
+  }
+
+  markCached() {
+    this.finishExecution("cached");
+  }
+
   loadPreview(preview) {
     if (!preview?.filename) return;
     this.pausePlayback();
@@ -871,10 +1025,10 @@ class VideoCombinePanel {
       });
       this.video.src = api.apiURL(`/view?${params.toString()}`);
     }
-    this.video.load();
     this.placeholder.textContent = "Loading preview…";
     this.placeholder.style.display = "flex";
-    this.setStatus("ready", "ready");
+    this.previewLoadToken = this.beginTransientProgress("loading preview");
+    this.video.load();
 
     const padded = preview.source_width !== preview.encoded_width || preview.source_height !== preview.encoded_height;
     const dimensions = padded
@@ -890,6 +1044,7 @@ class VideoCombinePanel {
     if (!preview) return;
     this.node.properties.lastPreview = { ...preview };
     this.node.properties.lastRenderSettings = this.settingsWidget.value;
+    this.finishExecution("rendered");
     this.loadPreview(preview);
   }
 
@@ -910,7 +1065,9 @@ class VideoCombinePanel {
   }
 
   dispose() {
+    videoCombinePanelsByNode.delete(nodeKey(this.node.id));
     removeSynchronizedPanel(this);
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
     if (this.handleDocumentPointerDown) {
       document.removeEventListener("pointerdown", this.handleDocumentPointerDown);
     }
@@ -958,6 +1115,7 @@ app.registerExtension({
 
     const panel = new VideoCombinePanel(node, settingsWidget, container);
     node._flVideoCombinePanel = panel;
+    videoCombinePanelsByNode.set(nodeKey(node.id), panel);
 
     const originalOnExecuted = node.onExecuted;
     node.onExecuted = function (message) {
@@ -969,10 +1127,36 @@ app.registerExtension({
     node.onConfigure = function (...args) {
       const result = originalOnConfigure?.apply(this, args);
       panel.configure();
+      videoCombinePanelsByNode.set(nodeKey(this.id), panel);
       requestAnimationFrame(() => enforceMinimumNodeSize(this));
       return result;
     };
 
     domWidget.onRemove = () => panel.dispose();
   },
+});
+
+api.addEventListener("executing", (event) => {
+  videoCombinePanelsByNode.get(nodeKey(eventNode(event.detail)))?.beginExecution();
+});
+
+api.addEventListener("progress", (event) => {
+  const detail = event.detail || {};
+  videoCombinePanelsByNode.get(nodeKey(detail.node))?.updateExecutionProgress(detail.value, detail.max);
+});
+
+api.addEventListener("execution_cached", (event) => {
+  const nodes = Array.isArray(event.detail?.nodes) ? event.detail.nodes : [];
+  for (const nodeId of nodes) videoCombinePanelsByNode.get(nodeKey(nodeId))?.markCached();
+});
+
+api.addEventListener("execution_error", (event) => {
+  const detail = event.detail || {};
+  videoCombinePanelsByNode.get(nodeKey(eventNode(detail)))?.failProgress("encode failed");
+});
+
+api.addEventListener("execution_interrupted", () => {
+  for (const panel of videoCombinePanelsByNode.values()) {
+    if (panel.executionActive) panel.failProgress("interrupted");
+  }
 });

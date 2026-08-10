@@ -9,7 +9,7 @@ import psutil
 import torch
 
 import folder_paths
-from comfy.utils import common_upscale
+from comfy.utils import ProgressBar, common_upscale
 from comfy_api.latest import InputImpl, Types
 
 
@@ -330,23 +330,29 @@ class FL_LoadVideo:
     DESCRIPTION = "Loads, previews, trims, samples, and resizes a video from ComfyUI input."
 
     def load_video(self, video, load_settings=DEFAULT_SETTINGS_JSON):
+        progress = ProgressBar(5)
+        progress.update_absolute(0)
         settings = _parse_settings(load_settings)
         path = resolve_video_path(video)
         probe = probe_video(path)
         plan = build_load_plan(probe, settings)
         _check_memory(plan)
 
+        progress.update_absolute(1)
         source = InputImpl.VideoFromFile(
             str(path),
             start_time=plan["start_time"],
             duration=plan["decode_duration"],
         )
         components = source.get_components()
+        progress.update_absolute(2)
         images, effective_fps = _sample_images(components.images, float(components.frame_rate), settings)
+        progress.update_absolute(3)
         images = _resize_images(images, settings)
         frame_count = int(images.shape[0])
         loaded_duration = frame_count / effective_fps
         audio = _trim_audio(components.audio, loaded_duration, settings["include_audio"])
+        progress.update_absolute(4)
         native_video = InputImpl.VideoFromComponents(
             Types.VideoComponents(
                 images=images,
@@ -375,6 +381,7 @@ class FL_LoadVideo:
             "has_audio": audio is not None,
             "bit_depth": probe["bit_depth"],
         }
+        progress.update_absolute(5)
         return {
             "ui": {"fl_load_video": [preview]},
             "result": (images, audio, native_video, float(effective_fps), frame_count),

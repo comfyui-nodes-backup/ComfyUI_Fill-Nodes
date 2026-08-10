@@ -19,6 +19,17 @@ const MIN_NODE_WIDTH = 420;
 const MIN_NODE_HEIGHT = 440;
 const MIN_PANEL_HEIGHT = 340;
 const VIDEO_EXTENSIONS = new Set(["avi", "gif", "m4v", "mkv", "mov", "mp4", "webm"]);
+const LOAD_PROGRESS_PHASES = ["preparing", "decoding frames", "sampling frames", "resizing frames", "finalizing"];
+const loadVideoPanels = new Map();
+
+function nodeKey(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function eventNode(detail) {
+  if (detail && typeof detail === "object") return detail.node ?? detail.node_id;
+  return detail;
+}
 
 const STYLES = `
   .flvl-panel {
@@ -204,6 +215,50 @@ const STYLES = `
   .flvl-status[data-state="stale"] { color: #fde68a; }
   .flvl-status[data-state="busy"] { color: #c4b5fd; }
   .flvl-status[data-state="error"] { color: #fda4af; }
+  .flvl-progress {
+    background: rgba(23, 24, 29, .9);
+    border: 1px solid rgba(255, 255, 255, .09);
+    border-radius: 999px;
+    bottom: 38px;
+    height: 7px;
+    left: 7px;
+    overflow: hidden;
+    position: absolute;
+    right: 7px;
+    z-index: 7;
+  }
+  .flvl-progress[hidden] { display: none; }
+  .flvl-progress-fill {
+    background: linear-gradient(90deg, #7c3aed, #a78bfa);
+    display: block;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+    transition: width 160ms ease;
+    width: 0;
+  }
+  .flvl-progress[data-state="active"] .flvl-progress-fill::after {
+    animation: flvl-progress-sheen 1s linear infinite;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .5), transparent);
+    content: "";
+    inset: 0;
+    position: absolute;
+    transform: translateX(-100%);
+  }
+  .flvl-progress[data-indeterminate="true"] .flvl-progress-fill {
+    animation: flvl-progress-slide 1s ease-in-out infinite alternate;
+    transition: none;
+    width: 42% !important;
+  }
+  .flvl-progress[data-state="complete"] .flvl-progress-fill { background: #22c55e; }
+  .flvl-progress[data-state="error"] .flvl-progress-fill { background: #ef4444; }
+  @keyframes flvl-progress-sheen {
+    to { transform: translateX(100%); }
+  }
+  @keyframes flvl-progress-slide {
+    from { transform: translateX(-20%); }
+    to { transform: translateX(140%); }
+  }
   .flvl-preview-controls {
     align-items: center;
     background: linear-gradient(to bottom, rgba(9, 10, 13, 0), rgba(9, 10, 13, .94) 44%);
@@ -521,25 +576,6 @@ const STYLES = `
     z-index: 10;
   }
   .flvl-error[hidden] { display: none; }
-  .flvl-upload-progress {
-    background: #292b32;
-    border-radius: 999px;
-    height: 4px;
-    margin-top: 2px;
-    overflow: hidden;
-    width: min(180px, 75%);
-  }
-  .flvl-upload-progress > span {
-    animation: flvl-upload 1s ease-in-out infinite alternate;
-    background: var(--flvl-accent);
-    display: block;
-    height: 100%;
-    width: 45%;
-  }
-  @keyframes flvl-upload {
-    from { transform: translateX(-20%); }
-    to { transform: translateX(140%); }
-  }
 `;
 
 function injectStyles() {
@@ -618,6 +654,9 @@ class LoadVideoPanel {
     this.dragDepth = 0;
     this.trimDrag = null;
     this.disposed = false;
+    this.executionActive = false;
+    this.progressToken = 0;
+    this.progressHideTimer = null;
 
     this.node.properties ||= {};
     if (!Number.isFinite(this.node.properties.previewVolume)) this.node.properties.previewVolume = 0.8;
@@ -670,7 +709,9 @@ class LoadVideoPanel {
             <div class="flvl-drop-icon">＋</div>
             <div class="flvl-drop-title" data-role="drop-title">Drop a video here</div>
             <div class="flvl-drop-help" data-role="drop-help">or click to browse</div>
-            <div class="flvl-upload-progress" data-role="upload-progress" hidden><span></span></div>
+          </div>
+          <div class="flvl-progress" data-role="progress" data-state="active" data-indeterminate="false" role="progressbar" hidden>
+            <span class="flvl-progress-fill" data-role="progress-fill"></span>
           </div>
           <div class="flvl-preview-controls">
             <button class="flvl-icon-button" data-action="play" type="button" title="Play or pause preview">▶</button>
@@ -781,7 +822,8 @@ class LoadVideoPanel {
     this.dropZone = this.container.querySelector('[data-role="drop-zone"]');
     this.dropTitle = this.container.querySelector('[data-role="drop-title"]');
     this.dropHelp = this.container.querySelector('[data-role="drop-help"]');
-    this.uploadProgress = this.container.querySelector('[data-role="upload-progress"]');
+    this.progress = this.container.querySelector('[data-role="progress"]');
+    this.progressFill = this.container.querySelector('[data-role="progress-fill"]');
     this.error = this.container.querySelector('[data-role="error"]');
     this.time = this.container.querySelector('[data-role="time"]');
     this.volume = this.container.querySelector('[data-role="volume"]');
@@ -973,7 +1015,7 @@ class LoadVideoPanel {
     this.dropZone.hidden = false;
     this.dropTitle.textContent = `Uploading ${file.name}`;
     this.dropHelp.textContent = "Copying into ComfyUI input…";
-    this.uploadProgress.hidden = false;
+    const progressToken = this.beginTransientProgress("uploading");
     this.setObjectPreview(file);
 
     try {
@@ -991,8 +1033,9 @@ class LoadVideoPanel {
       if (previousSource) await this.selectSource(previousSource);
       else this.removeSource(false);
       this.showError(message);
+      this.failProgress("upload failed");
     } finally {
-      this.uploadProgress.hidden = true;
+      this.finishTransientProgress(progressToken);
     }
   }
 
@@ -1031,6 +1074,9 @@ class LoadVideoPanel {
 
   removeSource(markGraph = true) {
     this.probeId += 1;
+    this.progressToken += 1;
+    this.executionActive = false;
+    this.hideProgress();
     this.revokeObjectUrl();
     this.video.pause();
     this.video.removeAttribute("src");
@@ -1072,6 +1118,7 @@ class LoadVideoPanel {
 
   async probeSource(path) {
     const probeId = ++this.probeId;
+    const progressToken = this.beginTransientProgress("probing");
     try {
       const params = new URLSearchParams({ filename: path });
       const response = await api.fetchApi(`/fl/load-video/info?${params.toString()}`);
@@ -1090,10 +1137,12 @@ class LoadVideoPanel {
       this.applyTrimWindow();
       this.updateMemoryEstimate();
       this.clearError();
+      this.finishTransientProgress(progressToken, "ready");
     } catch (error) {
       if (this.disposed || probeId !== this.probeId) return;
       this.sourceInfo = null;
       this.showError(error.message || "Could not inspect video.");
+      this.failTransientProgress(progressToken, "probe failed");
     }
   }
 
@@ -1535,7 +1584,93 @@ class LoadVideoPanel {
     this.node.properties.lastExecutionInfo = { ...info };
     this.node.properties.lastLoadSettings = this.settingsWidget.value;
     this.updateSourceSummary();
-    this.setStatus("ready", "loaded");
+    this.finishExecution("loaded");
+  }
+
+  showProgress(value, max, label, state = "active", indeterminate = false) {
+    if (this.progressHideTimer !== null) {
+      clearTimeout(this.progressHideTimer);
+      this.progressHideTimer = null;
+    }
+    const total = Math.max(1, Number(max) || 1);
+    const current = Math.max(0, Math.min(total, Number(value) || 0));
+    this.progress.hidden = false;
+    this.progress.dataset.state = state;
+    this.progress.dataset.indeterminate = String(indeterminate);
+    this.progress.setAttribute("aria-valuemin", "0");
+    this.progress.setAttribute("aria-valuemax", String(total));
+    this.progress.setAttribute("aria-valuenow", String(current));
+    this.progressFill.style.width = `${current / total * 100}%`;
+    if (state === "error") this.setStatus("error", label);
+    else if (state === "complete") this.setStatus("ready", label);
+    else this.setStatus("busy", label);
+  }
+
+  hideProgress() {
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
+    this.progressHideTimer = null;
+    this.progress.hidden = true;
+    this.progressFill.style.width = "0%";
+  }
+
+  scheduleProgressHide() {
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
+    this.progressHideTimer = window.setTimeout(() => {
+      this.progress.hidden = true;
+      this.progressHideTimer = null;
+    }, 900);
+  }
+
+  beginTransientProgress(label) {
+    const token = ++this.progressToken;
+    if (!this.executionActive) this.showProgress(0, 1, label, "active", true);
+    return token;
+  }
+
+  finishTransientProgress(token, label = "ready") {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(1, 1, label, "complete");
+    this.scheduleProgressHide();
+  }
+
+  failTransientProgress(token, label) {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(1, 1, label, "error");
+  }
+
+  beginExecution() {
+    this.progressToken += 1;
+    this.executionActive = true;
+    this.showProgress(0, LOAD_PROGRESS_PHASES.length, LOAD_PROGRESS_PHASES[0], "active", true);
+  }
+
+  updateExecutionProgress(value, max) {
+    this.executionActive = true;
+    const total = Math.max(1, Number(max) || LOAD_PROGRESS_PHASES.length);
+    const current = Math.max(0, Math.min(total, Number(value) || 0));
+    if (current >= total) {
+      this.finishExecution("loaded");
+      return;
+    }
+    const label = LOAD_PROGRESS_PHASES[Math.min(LOAD_PROGRESS_PHASES.length - 1, Math.floor(current))];
+    this.showProgress(current, total, label, "active");
+  }
+
+  finishExecution(label) {
+    this.executionActive = false;
+    this.progressToken += 1;
+    this.showProgress(1, 1, label, "complete");
+    this.scheduleProgressHide();
+  }
+
+  failProgress(label) {
+    this.executionActive = false;
+    this.progressToken += 1;
+    this.showProgress(1, 1, label, "error");
+  }
+
+  markCached() {
+    this.finishExecution("cached");
   }
 
   setStatus(state, label) {
@@ -1582,6 +1717,8 @@ class LoadVideoPanel {
   dispose() {
     this.disposed = true;
     this.probeId += 1;
+    loadVideoPanels.delete(nodeKey(this.node.id));
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
     document.removeEventListener("pointerdown", this.handleDocumentPointerDown);
     document.removeEventListener("keydown", this.handleDocumentKeyDown);
     this.trimResizeObserver?.disconnect();
@@ -1619,6 +1756,7 @@ app.registerExtension({
     requestAnimationFrame(() => enforceMinimumNodeSize(node));
 
     const panel = new LoadVideoPanel(node, videoWidget, settingsWidget, container);
+    loadVideoPanels.set(nodeKey(node.id), panel);
 
     const originalOnExecuted = node.onExecuted;
     node.onExecuted = function (message) {
@@ -1630,10 +1768,36 @@ app.registerExtension({
     node.onConfigure = function (...args) {
       const result = originalOnConfigure?.apply(this, args);
       panel.configure();
+      loadVideoPanels.set(nodeKey(this.id), panel);
       requestAnimationFrame(() => enforceMinimumNodeSize(this));
       return result;
     };
 
     domWidget.onRemove = () => panel.dispose();
   },
+});
+
+api.addEventListener("executing", (event) => {
+  loadVideoPanels.get(nodeKey(eventNode(event.detail)))?.beginExecution();
+});
+
+api.addEventListener("progress", (event) => {
+  const detail = event.detail || {};
+  loadVideoPanels.get(nodeKey(detail.node))?.updateExecutionProgress(detail.value, detail.max);
+});
+
+api.addEventListener("execution_cached", (event) => {
+  const nodes = Array.isArray(event.detail?.nodes) ? event.detail.nodes : [];
+  for (const nodeId of nodes) loadVideoPanels.get(nodeKey(nodeId))?.markCached();
+});
+
+api.addEventListener("execution_error", (event) => {
+  const detail = event.detail || {};
+  loadVideoPanels.get(nodeKey(eventNode(detail)))?.failProgress("load failed");
+});
+
+api.addEventListener("execution_interrupted", () => {
+  for (const panel of loadVideoPanels.values()) {
+    if (panel.executionActive) panel.failProgress("interrupted");
+  }
 });
