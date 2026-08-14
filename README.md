@@ -493,6 +493,7 @@ Strict scheduling evaluates H3 once per unique active prompt on every sampling s
 
 | Node | Description |
 |------|-------------|
+| `FL_MiniMaxMusic3Loader` | Downloads and verifies the official ComfyUI MiniMax Music 3 artifact set when missing, then loads and returns the MODEL, CLIP, and VAE. Its embedded dashboard reports installed and partial files, per-artifact download progress, verification, loading, cached execution, interruption, and errors. Advanced controls provide the core ComfyUI diffusion weight dtypes and optional CPU text-encoder execution. The first queued run downloads approximately 13.34 GiB; later runs reuse the installed files. |
 | `FL_NodeLoader` | A pass-through node that accepts and returns a TRIGGER type, designed for node dependency management in workflows. |
 | `FL_NodePackLoader` | A pass-through node with IS_CHANGED set to float('NaN') to ensure it always processes when triggered, useful for forcing workflow execution. |
 | `FL_UpscaleModel` | Upscales images in configurable batches using loaded upscale models with precision control (auto/32/16/bfloat16), optional downscaling by factor, multiple rescale methods (nearest-exact, bilinear, area, bicubic, lanczos), and TQDM progress tracking. |
