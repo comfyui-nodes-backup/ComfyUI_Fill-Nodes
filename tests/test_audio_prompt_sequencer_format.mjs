@@ -9,12 +9,12 @@ import {
 } from "../web/nodes/audio/audio_prompt_sequencer_format.js";
 
 test("saved sequencer versions 6 through the current format remain compatible", () => {
-  assert.equal(FORMAT_VERSION, 16);
+  assert.equal(FORMAT_VERSION, 17);
   for (let version = 6; version <= FORMAT_VERSION; version++) {
     assert.equal(isCompatibleFormatVersion(version), true);
   }
   assert.equal(isCompatibleFormatVersion(5), false);
-  assert.equal(isCompatibleFormatVersion(17), false);
+  assert.equal(isCompatibleFormatVersion(18), false);
   assert.equal(isCompatibleFormatVersion("invalid"), false);
 });
 

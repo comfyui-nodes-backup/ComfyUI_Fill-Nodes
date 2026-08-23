@@ -78,6 +78,9 @@ class FakePostprocessor:
 
 
 class BeatThisDetectorTests(unittest.TestCase):
+    def tearDown(self):
+        detector._verified_checkpoint_stat.cache_clear()
+
     def package_patches(self):
         return (
             mock.patch.object(detector, "_IMPORT_ERROR", ""),
@@ -137,6 +140,29 @@ class BeatThisDetectorTests(unittest.TestCase):
                 detector.ensure_checkpoint()
 
             request.assert_not_called()
+
+    def test_verified_checkpoint_reuses_unchanged_digest(self):
+        data = b"verified"
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "beat_this-final0.ckpt"
+            path.write_bytes(data)
+            with (
+                mock.patch.object(detector, "MODEL_SIZE", len(data)),
+                mock.patch.object(
+                    detector,
+                    "MODEL_SHA256",
+                    hashlib.sha256(data).hexdigest(),
+                ),
+                mock.patch.object(
+                    detector,
+                    "_file_sha256",
+                    wraps=detector._file_sha256,
+                ) as checksum,
+            ):
+                self.assertTrue(detector._verified_checkpoint(path))
+                self.assertTrue(detector._verified_checkpoint(path))
+
+        checksum.assert_called_once_with(path)
 
     def test_bad_checksum_does_not_promote_partial_download(self):
         data = b"invalid"

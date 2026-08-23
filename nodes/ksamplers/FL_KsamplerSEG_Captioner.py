@@ -21,12 +21,10 @@ from server import PromptServer
 
 from .FL_KsamplerSEG_common import unwrap_regions, attach_captions
 
+from ..ai._language_models import OPENROUTER_VISION_MODELS
 
-CAPTIONER_MODELS = [
-    "openai/gpt-4o-mini",
-    "google/gemini-flash-1.5",
-    "anthropic/claude-haiku-4.5",
-]
+
+CAPTIONER_MODELS = list(OPENROUTER_VISION_MODELS)
 
 
 class FL_KsamplerSEG_Captioner:
@@ -37,7 +35,7 @@ class FL_KsamplerSEG_Captioner:
                 "regions": ("SEG_REGIONS",),
                 "source_image": ("IMAGE",),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "model": (CAPTIONER_MODELS, {"default": "openai/gpt-4o-mini"}),
+                "model": (CAPTIONER_MODELS, {"default": "google/gemini-3.7-flash"}),
                 "prompt_template": ("STRING", {
                     "default": "Describe the contents of this image region in 10-15 words. Focus on what's visible. Output only the description, nothing else.",
                     "multiline": True,
@@ -53,6 +51,9 @@ class FL_KsamplerSEG_Captioner:
                 "caption_first_frame_only": ("BOOLEAN", {"default": True}),
                 "show_preview": ("BOOLEAN", {"default": True}),
             },
+            "optional": {
+                "custom_model": ("STRING", {"default": "", "placeholder": "Optional OpenRouter vision model ID override"}),
+            },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
@@ -64,8 +65,7 @@ class FL_KsamplerSEG_Captioner:
     def caption(self, regions, source_image, api_key, model, prompt_template,
                 prefix, suffix, max_tokens, parallel_requests,
                 default_negative_prompt, caption_first_frame_only,
-                show_preview, unique_id=None):
-        regions = unwrap_regions(regions)
+                show_preview, unique_id=None, custom_model=""):
 
         key = (api_key or "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
         if not key:
@@ -74,6 +74,7 @@ class FL_KsamplerSEG_Captioner:
                 "widget or set OPENROUTER_API_KEY env var."
             )
 
+        model = custom_model.strip() or model
         # Pull the captioning frame.
         if caption_first_frame_only or source_image.shape[0] == 1:
             frame_idx = 0

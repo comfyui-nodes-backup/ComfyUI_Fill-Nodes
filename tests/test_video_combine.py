@@ -226,10 +226,10 @@ class VideoCombineExecutionTests(unittest.TestCase):
             )
 
         save_path.assert_called_once_with("clips/test", "D:\\temp", 8, 6)
-        progress_type.assert_called_once_with(3)
+        progress_type.assert_called_once_with(100)
         self.assertEqual(
             [call.args[0] for call in progress_type.return_value.update_absolute.call_args_list],
-            [0, 1, 2, 3],
+            [10, 95, 100],
         )
         components = create_video.call_args.args[0]
         self.assertEqual(components.images.shape, (3, 6, 8, 3))
@@ -323,6 +323,13 @@ class VideoCombineFrontendTests(unittest.TestCase):
             "pauseAllVideoCombinePreviews()",
             "COMBINE_PROGRESS_PHASES",
             'beginTransientProgress("loading preview")',
+            'this.video.addEventListener("loadstart"',
+            'this.video.addEventListener("stalled"',
+            'this.video.addEventListener("abort"',
+            'this.progress.setAttribute("aria-valuetext", label)',
+            'this.progress.removeAttribute("aria-valuenow")',
+            'this.previewRegion.setAttribute("aria-busy"',
+            "progressPhase(COMBINE_PROGRESS_PHASES",
             'api.addEventListener("progress"',
             'api.addEventListener("execution_cached"',
             'api.addEventListener("execution_interrupted"',

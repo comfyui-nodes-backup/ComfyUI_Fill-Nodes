@@ -3,6 +3,8 @@ import json
 import math
 from typing import Tuple
 
+from .audio_envelope import make_audio_envelope
+
 
 class FL_Audio_Reactive_Envelope:
     """
@@ -10,8 +12,8 @@ class FL_Audio_Reactive_Envelope:
     Creates ADSR envelopes for kicks, snares, and hi-hats across the entire song.
     """
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("kick_envelope_json", "snare_envelope_json", "hihat_envelope_json")
+    RETURN_TYPES = ("FL_AUDIO_ENVELOPE", "FL_AUDIO_ENVELOPE", "FL_AUDIO_ENVELOPE")
+    RETURN_NAMES = ("kick_envelope", "snare_envelope", "hihat_envelope")
     FUNCTION = "generate_envelopes"
     CATEGORY = "🏵️Fill Nodes/Audio"
 
@@ -138,7 +140,7 @@ class FL_Audio_Reactive_Envelope:
         hihat_decay_frames: int = 4,
         hihat_sustain_level: float = 0.0,
         hihat_release_frames: int = 5,
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[dict, dict, dict]:
         """
         Generate per-frame envelopes from drum detections
 
@@ -148,7 +150,7 @@ class FL_Audio_Reactive_Envelope:
             (Additional ADSR parameters for each drum type)
 
         Returns:
-            Tuple of (kick_envelope_json, snare_envelope_json, hihat_envelope_json) as JSON strings
+            Kick, snare, and hi-hat FL audio envelopes
         """
         drum_data = json.loads(drum_times_json)
         kick_times = drum_data["kick_times"]
@@ -170,11 +172,11 @@ class FL_Audio_Reactive_Envelope:
             hihat_attack_frames, hihat_decay_frames, hihat_sustain_level, hihat_release_frames
         )
 
-        metadata = {"fps": fps, "duration": duration}
-        kick_json = json.dumps({"envelope": kick_envelope, "total_frames": len(kick_envelope), **metadata})
-        snare_json = json.dumps({"envelope": snare_envelope, "total_frames": len(snare_envelope), **metadata})
-        hihat_json = json.dumps({"envelope": hihat_envelope, "total_frames": len(hihat_envelope), **metadata})
-        return (kick_json, snare_json, hihat_json)
+        return (
+            make_audio_envelope(kick_envelope, fps, duration, "kick"),
+            make_audio_envelope(snare_envelope, fps, duration, "snare"),
+            make_audio_envelope(hihat_envelope, fps, duration, "hihat"),
+        )
 
     def _generate_envelope(
         self,

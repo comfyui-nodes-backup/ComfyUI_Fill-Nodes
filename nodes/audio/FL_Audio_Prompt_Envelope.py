@@ -1,9 +1,9 @@
-import json
 import math
 
 from comfy_api.latest import io
 
 from .FL_Audio_Beat_Prompt_Schedule import _beat_to_seconds, _load_beats
+from .audio_envelope import FLAudioEnvelope, load_audio_envelope, make_audio_envelope
 
 
 FLPromptEnvelope = io.Custom("FL_PROMPT_ENVELOPE")
@@ -38,8 +38,6 @@ def _beat_envelope(
     attack_beats,
     hold_beats,
     release_beats,
-    floor_strength,
-    peak_strength,
     curve,
 ):
     maximum = len(beat_times)
@@ -71,45 +69,13 @@ def _beat_envelope(
             ),
             default=0.0,
         )
-        values.append(floor_strength + amount * (peak_strength - floor_strength))
+        values.append(amount)
     return values, [event[1] for event in events]
 
 
-def _load_envelope(envelope_json, source_fps):
-    try:
-        data = json.loads(envelope_json)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"Audio envelope is not valid JSON: {error.msg}.") from error
-    if not isinstance(data, dict):
-        raise ValueError("Audio envelope must be a JSON object.")
-
-    raw_values = data.get("envelope")
-    if not isinstance(raw_values, list) or not raw_values:
-        raise ValueError("Audio envelope must contain a non-empty envelope list.")
-    values = []
-    for index, value in enumerate(raw_values):
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"Audio envelope value {index} must be a number.") from error
-        if not math.isfinite(number):
-            raise ValueError(f"Audio envelope value {index} must be finite.")
-        values.append(number)
-
-    try:
-        fps = float(data.get("fps", source_fps))
-    except (TypeError, ValueError) as error:
-        raise ValueError("Audio envelope fps must be a number.") from error
-    if not math.isfinite(fps) or fps <= 0:
-        raise ValueError("Audio envelope fps must be greater than zero.")
-
-    try:
-        duration = float(data.get("duration", len(values) / fps))
-    except (TypeError, ValueError) as error:
-        raise ValueError("Audio envelope duration must be a number.") from error
-    if not math.isfinite(duration) or duration <= 0:
-        raise ValueError("Audio envelope duration must be greater than zero.")
-    return values, fps, duration
+def _load_envelope(envelope):
+    data = load_audio_envelope(envelope)
+    return data["values"], data["fps"], data["duration"]
 
 
 def _map_envelope(
@@ -140,15 +106,6 @@ def _envelope_object(prompt, values, fps, duration):
         "prompt": prompt.strip(),
         "weights": values,
     }
-
-
-def _envelope_json(values, fps, duration):
-    return json.dumps({
-        "envelope": values,
-        "total_frames": len(values),
-        "fps": fps,
-        "duration": duration,
-    })
 
 
 def _preview(values, fps, duration, hit_times=None):
@@ -267,9 +224,9 @@ class FL_Audio_Beat_Prompt_Envelope(io.ComfyNode):
                     display_name="prompt_envelope",
                     tooltip="Reactive prompt and temporal mask weights for compatible FL diffusion nodes.",
                 ),
-                io.String.Output(
-                    display_name="envelope_json",
-                    tooltip="Envelope JSON compatible with FL audio-reactive preview and post-effect nodes.",
+                FLAudioEnvelope.Output(
+                    display_name="envelope",
+                    tooltip="Normalized FL audio envelope compatible with reactive preview and post-effect nodes.",
                 ),
                 io.String.Output(
                     display_name="preview",
@@ -312,14 +269,16 @@ class FL_Audio_Beat_Prompt_Envelope(io.ComfyNode):
             attack_beats,
             hold_beats,
             release_beats,
-            floor_strength,
-            peak_strength,
             curve,
         )
+        mapped = [
+            floor_strength + value * (peak_strength - floor_strength)
+            for value in values
+        ]
         return io.NodeOutput(
-            _envelope_object(reactive_prompt, values, fps, duration),
-            _envelope_json(values, fps, duration),
-            _preview(values, fps, duration, hit_times),
+            _envelope_object(reactive_prompt, mapped, fps, duration),
+            make_audio_envelope(values, fps, duration, "beat_grid"),
+            _preview(mapped, fps, duration, hit_times),
         )
 
 
@@ -335,10 +294,9 @@ class FL_Audio_Envelope_Prompt(io.ComfyNode):
                 "to diffusion prompt mask strength."
             ),
             inputs=[
-                io.String.Input(
-                    "envelope_json",
-                    force_input=True,
-                    tooltip="Connect an envelope JSON output from FL Audio Reactive Envelope or another compatible FL node.",
+                FLAudioEnvelope.Input(
+                    "envelope",
+                    tooltip="Connect an FL audio envelope from the sequencer or another compatible FL node.",
                 ),
                 io.String.Input(
                     "reactive_prompt",
@@ -346,14 +304,6 @@ class FL_Audio_Envelope_Prompt(io.ComfyNode):
                     dynamic_prompts=True,
                     default="A sharp burst of light and rapid geometric deformation.",
                     tooltip="Action or visual change controlled by the incoming envelope.",
-                ),
-                io.Float.Input(
-                    "source_fps",
-                    default=24.0,
-                    min=1.0,
-                    max=120.0,
-                    step=1.0,
-                    tooltip="Fallback FPS for older envelope JSON that does not contain fps metadata.",
                 ),
                 io.Float.Input(
                     "threshold",
@@ -408,9 +358,8 @@ class FL_Audio_Envelope_Prompt(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        envelope_json,
+        envelope,
         reactive_prompt,
-        source_fps,
         threshold,
         response_gamma,
         floor_strength,
@@ -422,7 +371,7 @@ class FL_Audio_Envelope_Prompt(io.ComfyNode):
         if peak_strength < floor_strength:
             raise ValueError("Peak strength must be greater than or equal to floor strength.")
 
-        values, fps, duration = _load_envelope(envelope_json, source_fps)
+        values, fps, duration = _load_envelope(envelope)
         mapped = _map_envelope(
             values,
             threshold,

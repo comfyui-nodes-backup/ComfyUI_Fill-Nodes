@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -19,6 +20,15 @@ SPEC = importlib.util.spec_from_file_location(f"{PACKAGE_NAME}.audio_timeline", 
 timeline = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = timeline
 SPEC.loader.exec_module(timeline)
+
+
+def audio_range_loader(audio):
+    def load(filename, start_sample, sample_count):
+        return pathlib.Path(filename), {
+            "waveform": audio["waveform"][..., start_sample:start_sample + sample_count].clone(),
+            "sample_rate": audio["sample_rate"],
+        }
+    return load
 
 
 class AudioTimelineTests(unittest.TestCase):
@@ -284,6 +294,7 @@ class AudioTimelineTests(unittest.TestCase):
             with (
                 mock.patch.object(timeline, "resolve_audio_path", return_value=pathlib.Path("song.wav")),
                 mock.patch.object(timeline, "load_audio_file", return_value=(pathlib.Path("song.wav"), master)),
+                mock.patch.object(timeline, "load_audio_file_range", side_effect=audio_range_loader(master)),
                 mock.patch.object(timeline, "load_cached_stem", return_value=stem) as load_stem,
                 mock.patch.object(timeline, "analysis_cache_key", return_value="key"),
                 mock.patch.object(timeline, "_cache_path", return_value=cache_path),
@@ -309,6 +320,40 @@ class AudioTimelineTests(unittest.TestCase):
         self.assertEqual(analyze.call_args.kwargs["beat_audio"]["waveform"].mean(), 1.0)
         self.assertEqual(analyze.call_count, 1)
         self.assertEqual(load_stem.call_count, 1)
+
+    def test_cached_analysis_without_sample_rate_keeps_full_decode_fallback(self):
+        master = {"waveform": torch.ones(1, 1, 48000), "sample_rate": 48000}
+        source_analysis = {
+            "audio_file": "song.wav",
+            "source_duration": 1.0,
+            "audio_duration": 1.0,
+            "beat_times": [],
+            "downbeat_times": [],
+            "detected_beat_times": [],
+            "onset_times": [],
+            "drum_times": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = pathlib.Path(directory) / "analysis.json"
+            cache_path.write_text(json.dumps(source_analysis), encoding="utf-8")
+            with (
+                mock.patch.object(timeline, "resolve_audio_path", return_value=pathlib.Path("song.wav")),
+                mock.patch.object(timeline, "load_audio_file", return_value=(pathlib.Path("song.wav"), master)) as load_full,
+                mock.patch.object(timeline, "load_audio_file_range") as load_range,
+                mock.patch.object(timeline, "analysis_cache_key", return_value="key"),
+                mock.patch.object(timeline, "_cache_path", return_value=cache_path),
+            ):
+                _, cropped = timeline.analyze_audio_file(
+                    "song.wav",
+                    fps=24.0,
+                    trim_start_frame=6,
+                    length_frames=12,
+                    detect_beats=False,
+                )
+
+        load_full.assert_called_once_with("song.wav")
+        load_range.assert_not_called()
+        self.assertEqual(cropped["waveform"].shape[-1], 24000)
 
     def test_offset_changes_reuse_the_base_analysis_cache(self):
         master = {"waveform": torch.ones(1, 1, 48000), "sample_rate": 48000}
@@ -406,6 +451,7 @@ class AudioTimelineTests(unittest.TestCase):
             with (
                 mock.patch.object(timeline, "resolve_audio_path", return_value=pathlib.Path("song.wav")),
                 mock.patch.object(timeline, "load_audio_file", return_value=(pathlib.Path("song.wav"), master)),
+                mock.patch.object(timeline, "load_audio_file_range", side_effect=audio_range_loader(master)),
                 mock.patch.object(timeline, "analysis_cache_key", return_value="key"),
                 mock.patch.object(timeline, "_cache_path", return_value=cache_path),
                 mock.patch.object(timeline, "analyze_audio", return_value=source_analysis) as analyze,
@@ -453,6 +499,7 @@ class AudioTimelineTests(unittest.TestCase):
             with (
                 mock.patch.object(timeline, "resolve_audio_path", return_value=pathlib.Path("song.wav")),
                 mock.patch.object(timeline, "load_audio_file", return_value=(pathlib.Path("song.wav"), master)),
+                mock.patch.object(timeline, "load_audio_file_range", side_effect=audio_range_loader(master)),
                 mock.patch.object(timeline, "analysis_cache_key", return_value="key"),
                 mock.patch.object(timeline, "_cache_path", return_value=cache_path),
                 mock.patch.object(timeline, "analyze_audio", return_value=source_analysis) as analyze,

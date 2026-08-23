@@ -179,6 +179,19 @@ class BeatPromptScheduleTests(unittest.TestCase):
         self.assertEqual(section["fade_out_start"], 1.75)
         self.assertEqual(output.result[1], 48)
 
+    def test_sequence_duration_allows_audio_sample_rounding(self):
+        sample_rate = 44100
+        expected_duration = 703 / 24
+        audio_duration = round(expected_duration * sample_rate) / sample_rate
+
+        self.assertLess(audio_duration, expected_duration)
+        self.assertEqual(
+            schedule._resolve_duration(703, audio_duration, 24, sample_rate),
+            audio_duration,
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            schedule._resolve_duration(704, audio_duration, 24, sample_rate)
+
     def test_frames_mode_rejects_fractional_frames(self):
         with self.assertRaisesRegex(ValueError, "whole frame"):
             schedule.FL_Audio_Beat_Prompt_Schedule.execute(
@@ -457,6 +470,7 @@ class BeatPromptScheduleTests(unittest.TestCase):
                 "beat_grid_density",
                 "render_groups",
                 "analysis_cache_key",
+                "envelope_layers",
             ],
         )
         self.assertEqual(
@@ -466,8 +480,142 @@ class BeatPromptScheduleTests(unittest.TestCase):
                 "total_frames",
                 "audio",
                 "BPM",
+                "envelope_1",
+                "envelope_2",
+                "envelope_3",
+                "prompt_envelopes",
             ],
         )
+
+    def test_reactive_slots_emit_typed_audio_and_prompt_envelopes(self):
+        layers = json.dumps({
+            "version": 1,
+            "slots": [{
+                "enabled": True,
+                "source": "beat_grid",
+                "prompt": "Punch toward camera.",
+                "stride": 1,
+                "phase": 0,
+                "attack_frames": 0,
+                "hold_frames": 1,
+                "release_frames": 2,
+                "curve": "linear",
+                "floor_strength": 0.25,
+                "peak_strength": 3.0,
+            }, None, None],
+        })
+        result = schedule.FL_Audio_Beat_Prompt_Schedule.execute(
+            beat_positions=beat_json(),
+            timeline="[0 - 60]\nCamera move.",
+            default_fade_in=0.0,
+            default_fade_out=0.0,
+            curve="linear",
+            fps=24.0,
+            sequence_duration=60,
+            envelope_layers=layers,
+        ).result
+
+        envelope = result[4]
+        self.assertEqual(envelope["type"], "fl_audio_envelope")
+        self.assertEqual(envelope["version"], 1)
+        self.assertEqual(envelope["source"], "beat_grid")
+        self.assertEqual(envelope["slot"], 1)
+        self.assertEqual(envelope["total_frames"], 60)
+        self.assertEqual(len(envelope["values"]), result[1])
+        self.assertIsNone(result[5])
+        self.assertIsNone(result[6])
+        prompt_set = result[7]
+        self.assertEqual(prompt_set["type"], "fl_prompt_envelope_set")
+        self.assertEqual(prompt_set["envelopes"][0]["prompt"], "Punch toward camera.")
+        self.assertEqual(len(prompt_set["envelopes"][0]["weights"]), result[1])
+        self.assertAlmostEqual(min(prompt_set["envelopes"][0]["weights"]), 0.25)
+
+    def test_signal_only_layer_is_not_added_to_prompt_set(self):
+        result = schedule.FL_Audio_Beat_Prompt_Schedule.execute(
+            beat_positions=beat_json(),
+            timeline="[0 - 24]\nCamera move.",
+            default_fade_in=0.0,
+            default_fade_out=0.0,
+            curve="linear",
+            fps=24.0,
+            sequence_duration=24,
+            envelope_layers=json.dumps({
+                "version": 1,
+                "slots": [{
+                    "enabled": True,
+                    "source": "onset",
+                    "prompt": "",
+                    "stride": 1,
+                    "phase": 0,
+                    "attack_frames": 0,
+                    "hold_frames": 1,
+                    "release_frames": 1,
+                    "curve": "cosine",
+                    "floor_strength": 0.0,
+                    "peak_strength": 3.0,
+                }],
+            }),
+        ).result
+
+        self.assertEqual(result[4]["type"], "fl_audio_envelope")
+        self.assertEqual(result[7]["envelopes"], [])
+
+    def test_full_source_event_preserves_release_across_crop_start(self):
+        audio = {"waveform": torch.zeros(1, 1, 24000), "sample_rate": 24000}
+        analysis = {
+            "bpm": 120.0,
+            "beat_times": [0.0, 0.5],
+            "downbeat_times": [0.0],
+            "detected_beat_times": [0.0, 0.5],
+            "detected_downbeat_times": [0.0],
+            "onset_times": [],
+            "audio_duration": 1.0,
+            "source_duration": 2.0,
+            "source_start": 0.5,
+            "waveform_preview": None,
+            "drum_times": {"kick_times": [], "snare_times": [], "hihat_times": []},
+            "source_analysis": {
+                "type": "fl_audio_source_analysis",
+                "version": 1,
+                "beat_times": [0.0, 0.5, 1.0, 1.5],
+                "downbeat_times": [0.0, 1.0],
+                "detected_beat_times": [0.0, 0.5, 1.0, 1.5],
+                "onset_times": [0.45],
+                "drum_times": {
+                    "kick_times": [0.45],
+                    "snare_times": [],
+                    "hihat_times": [],
+                },
+            },
+        }
+        with mock.patch.object(schedule, "analyze_audio_file", return_value=(analysis, audio)):
+            result = schedule.FL_Audio_Beat_Prompt_Schedule.execute(
+                timeline="[0 - 24]\nCamera move.",
+                default_fade_in=0.0,
+                default_fade_out=0.0,
+                curve="linear",
+                fps=24.0,
+                sequence_duration=24,
+                audio_file="song.wav",
+                envelope_layers=json.dumps({
+                    "version": 1,
+                    "slots": [{
+                        "enabled": True,
+                        "source": "kick",
+                        "prompt": "Kick.",
+                        "stride": 1,
+                        "phase": 0,
+                        "attack_frames": 0,
+                        "hold_frames": 0,
+                        "release_frames": 6,
+                        "curve": "linear",
+                        "floor_strength": 0.0,
+                        "peak_strength": 3.0,
+                    }],
+                }),
+            ).result
+
+        self.assertGreater(result[4]["values"][0], 0.0)
 
     def test_uploaded_audio_drives_schedule_audio_and_bpm_outputs(self):
         audio = {"waveform": torch.zeros(1, 2, 48000), "sample_rate": 48000}
@@ -678,6 +826,33 @@ class BeatPromptScheduleTests(unittest.TestCase):
         self.assertEqual(payload["beat_grid_density"], "every_2_beats")
         self.assertEqual(payload["grid_bpm"], 50.0)
         self.assertEqual(output.result[3], 120.0)
+
+
+class BeatPromptScheduleFrontendTests(unittest.TestCase):
+    def test_preview_volume_is_accessible_persistent_and_reapplied(self):
+        script = (
+            pathlib.Path(__file__).parents[1]
+            / "web"
+            / "nodes"
+            / "audio"
+            / "audio_prompt_sequencer_editor.js"
+        ).read_text(encoding="utf-8")
+
+        for behavior in (
+            'data-role="playback-volume"',
+            'aria-label="Preview playback volume"',
+            "Preview volume only",
+            "syncPlaybackVolumeControl()",
+            "setPlaybackVolume(value, persist = false)",
+            "this.audioElement.volume = this.playbackVolume",
+            "playbackVolume: this.playbackVolume",
+        ):
+            with self.subTest(behavior=behavior):
+                self.assertIn(behavior, script)
+        schema_inputs = {
+            value.id for value in schedule.FL_Audio_Beat_Prompt_Schedule.define_schema().inputs
+        }
+        self.assertNotIn("playback_volume", schema_inputs)
 
 
 if __name__ == "__main__":

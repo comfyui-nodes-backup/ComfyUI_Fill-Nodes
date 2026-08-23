@@ -1,11 +1,12 @@
 import torch
 import numpy as np
-import json
 from PIL import Image
 from kornia.morphology import gradient
 import comfy.model_management
 
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 class FL_ImagePixelator:
     def __init__(self):
@@ -47,9 +48,8 @@ class FL_ImagePixelator:
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {
-                    "default": "",
-                    "description": "Optional: Envelope JSON for audio-reactive blending"
+                "envelope": ("FL_AUDIO_ENVELOPE", {
+                    "description": "Optional FL audio envelope for reactive blending"
                 }),
                 "blend_intensity": ("FLOAT", {
                     "default": 1.0,
@@ -77,12 +77,12 @@ class FL_ImagePixelator:
     FUNCTION = "pixelate_image"
     CATEGORY = "🏵️Fill Nodes/VFX"
 
-    def pixelate_image(self, image, envelope_json="", blend_intensity=1.0, invert=False, mask=None, scale_factor=0.05, kernel_size=3, modulation=0.0):
+    def pixelate_image(self, image, envelope=None, blend_intensity=1.0, invert=False, mask=None, scale_factor=0.05, kernel_size=3, modulation=0.0):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(image, envelope_json, blend_intensity, invert, mask, scale_factor, kernel_size, modulation)
+            return self._apply_audio_reactive(image, envelope, blend_intensity, invert, mask, scale_factor, kernel_size, modulation)
         else:
             return self._apply_static(image, mask, scale_factor, kernel_size, modulation)
 
@@ -144,7 +144,7 @@ class FL_ImagePixelator:
 
         return (image,)
 
-    def _apply_audio_reactive(self, image, envelope_json, blend_intensity, invert, mask, scale_factor, kernel_size, modulation):
+    def _apply_audio_reactive(self, image, envelope, blend_intensity, invert, mask, scale_factor, kernel_size, modulation):
         """Audio-reactive pixelation effect with envelope-based blending"""
         print(f"\n{'='*60}")
         print(f"[FL_ImagePixelator Audio Reactive] DEBUG: Function called")
@@ -154,12 +154,10 @@ class FL_ImagePixelator:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = image.shape[0]
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL_ImagePixelator Audio Reactive] Input frames: {batch_size}")
             print(f"[FL_ImagePixelator Audio Reactive] Envelope frames: {num_envelope_frames}")
@@ -217,7 +215,7 @@ class FL_ImagePixelator:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate blend amount
                 if invert:

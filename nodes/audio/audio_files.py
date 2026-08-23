@@ -1,9 +1,13 @@
 import hashlib
 import os
+from functools import lru_cache
 from pathlib import Path
 
+import av
+import torch
+
 import folder_paths
-from comfy_extras.nodes_audio import load
+from comfy_extras.nodes_audio import f32_pcm, load
 
 
 def available_audio_files():
@@ -56,7 +60,8 @@ def resolve_audio_path(filename):
     return path
 
 
-def audio_file_hash(path):
+@lru_cache(maxsize=128)
+def _audio_file_hash(path, size, modified_ns):
     digest = hashlib.sha256()
     with open(path, "rb") as audio_file:
         for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
@@ -64,7 +69,73 @@ def audio_file_hash(path):
     return digest.hexdigest()
 
 
+def audio_file_hash(path):
+    path = Path(path)
+    stat = path.stat()
+    return _audio_file_hash(str(path), stat.st_size, stat.st_mtime_ns)
+
+
 def load_audio_file(filename):
     path = resolve_audio_path(filename)
     waveform, sample_rate = load(str(path))
+    return path, {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+
+
+def _full_audio_file_range(path, start_sample, sample_count):
+    waveform, sample_rate = load(str(path))
+    end_sample = start_sample + sample_count
+    if end_sample > waveform.shape[-1]:
+        raise ValueError("The requested audio range extends past the end of the file.")
+    return {
+        "waveform": waveform[:, start_sample:end_sample].clone().unsqueeze(0),
+        "sample_rate": sample_rate,
+    }
+
+
+def load_audio_file_range(filename, start_sample, sample_count):
+    if start_sample < 0 or sample_count <= 0:
+        raise ValueError("Audio range samples must be positive and start at zero or later.")
+    path = resolve_audio_path(filename)
+    with av.open(str(path)) as audio_file:
+        if not audio_file.streams.audio:
+            raise ValueError("No audio stream found in the file.")
+        stream = audio_file.streams.audio[0]
+        sample_rate = stream.codec_context.sample_rate
+        channels = stream.channels
+        stream_start = stream.start_time or 0
+        seek_sample = max(0, start_sample - sample_rate)
+        seek_timestamp = stream_start + int(seek_sample / sample_rate / float(stream.time_base))
+        try:
+            audio_file.seek(seek_timestamp, stream=stream, backward=True)
+        except av.FFmpegError:
+            return path, _full_audio_file_range(path, start_sample, sample_count)
+
+        end_sample = start_sample + sample_count
+        frames = []
+        for frame in audio_file.decode(streams=stream.index):
+            if frame.pts is None:
+                continue
+            frame_start = round(
+                (frame.pts - stream_start) * float(frame.time_base) * sample_rate
+            )
+            samples = torch.from_numpy(frame.to_ndarray())
+            if samples.shape[0] != channels:
+                samples = samples.view(-1, channels).t()
+            frame_end = frame_start + samples.shape[1]
+            if frame_end <= start_sample:
+                continue
+            if frame_start >= end_sample:
+                break
+            left = max(0, start_sample - frame_start)
+            right = min(samples.shape[1], end_sample - frame_start)
+            if right > left:
+                frames.append(samples[:, left:right])
+            if frame_end >= end_sample:
+                break
+
+    if not frames:
+        return path, _full_audio_file_range(path, start_sample, sample_count)
+    waveform = f32_pcm(torch.cat(frames, dim=1))
+    if waveform.shape[-1] != sample_count:
+        return path, _full_audio_file_range(path, start_sample, sample_count)
     return path, {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}

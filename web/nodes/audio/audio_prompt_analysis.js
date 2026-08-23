@@ -1,4 +1,5 @@
 import { sourceTimes } from "./audio_timeline_coordinates.js";
+import { normalizeSongMap } from "./audio_prompt_song_map.js";
 
 const SOURCE_ANALYSIS_VERSION = 1;
 const EPSILON = 1e-6;
@@ -22,27 +23,6 @@ export function normalizeWaveformPreview(value) {
   if (!(duration > 0) || !(scale > 0)) return null;
   const peaks = value.peaks.map((peak) => finiteNumber(peak));
   return { version: 1, duration, scale, peaks };
-}
-
-export function waveformPreviewFromBuffer(buffer) {
-  const bucketCount = Math.min(8192, Math.max(1, Math.ceil(buffer.duration * 60)));
-  const peaks = new Array(bucketCount * 2);
-  for (let bucket = 0; bucket < bucketCount; bucket++) {
-    const start = Math.floor(bucket / bucketCount * buffer.length);
-    const end = Math.max(start + 1, Math.floor((bucket + 1) / bucketCount * buffer.length));
-    let minimum = 1;
-    let maximum = -1;
-    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-      const samples = buffer.getChannelData(channel);
-      for (let index = start; index < end; index++) {
-        minimum = Math.min(minimum, samples[index]);
-        maximum = Math.max(maximum, samples[index]);
-      }
-    }
-    peaks[bucket * 2] = Math.round(clamp(minimum, -1, 1) * 32767);
-    peaks[bucket * 2 + 1] = Math.round(clamp(maximum, -1, 1) * 32767);
-  }
-  return { version: 1, duration: buffer.duration, scale: 32767, peaks };
 }
 
 export function cropWaveformPreview(preview, startSeconds, duration) {
@@ -112,6 +92,7 @@ export function sourceAnalysisValue(value) {
     analysisSource: String(value.analysis_source || value.analysisSource || "mix"),
     beatAnalysisSource: String(value.beat_analysis_source || value.beatAnalysisSource || "mix"),
     analysisCacheHit: Boolean(value.analysis_cache_hit ?? value.analysisCacheHit),
+    songMap: normalizeSongMap(value.song_map ?? value.songMap),
   };
 }
 
@@ -205,6 +186,7 @@ export function sourceAnalysisFromCropPayload(value) {
     analysis_source: value.analysis_source || value.analysisSource,
     beat_analysis_source: value.beat_analysis_source || value.beatAnalysisSource,
     analysis_cache_hit: value.analysis_cache_hit ?? value.analysisCacheHit,
+    song_map: value.song_map || value.songMap,
   });
 }
 

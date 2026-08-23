@@ -1,6 +1,7 @@
 import hashlib
 import threading
 import time
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -108,11 +109,21 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=4)
+def _verified_checkpoint_stat(path, size, modified_ns, expected_size, expected_sha256):
+    return size == expected_size and _file_sha256(Path(path)) == expected_sha256
+
+
 def _verified_checkpoint(path):
-    return (
-        path.is_file()
-        and path.stat().st_size == MODEL_SIZE
-        and _file_sha256(path) == MODEL_SHA256
+    if not path.is_file():
+        return False
+    stat = path.stat()
+    return _verified_checkpoint_stat(
+        str(path),
+        stat.st_size,
+        stat.st_mtime_ns,
+        MODEL_SIZE,
+        MODEL_SHA256,
     )
 
 

@@ -19,7 +19,6 @@ import {
   normalizeWaveformPreview,
   sourceAnalysisFromCropPayload,
   sourceAnalysisValue,
-  waveformPreviewFromBuffer,
 } from "./audio_prompt_analysis.js";
 import {
   loadRenderGroups,
@@ -35,11 +34,42 @@ import {
   isCompatibleFormatVersion,
   restoreCachedAudioWidgets,
 } from "./audio_prompt_sequencer_format.js";
+import {
+  applyPromptWriterUpdates,
+  createPromptWriterDocument,
+} from "./audio_prompt_writer_document.js";
+import {
+  applySongMapOverrides,
+  createSongWriterContext,
+  nextSongMapSectionId,
+  normalizeSongMapOverrides,
+  replaceSongMapSections,
+  resetSongMapStructure,
+  songCueColor,
+  songSectionColor,
+  songSectionLabel,
+  updateSongMapOverride,
+  validateSongMapSections,
+} from "./audio_prompt_song_map.js";
+import {
+  createLyricsWriterContext,
+  isLyricsTimelineCurrent,
+  lyricsTimelineForStorage,
+  nextLyricsSegmentId,
+  normalizeLyricsTimeline,
+  parseLrcLyrics,
+  parseSrtLyrics,
+  validateLyricsSegments,
+} from "./audio_prompt_lyrics.js";
 import { injectBeatPromptSequencerStyles } from "./audio_prompt_sequencer_styles.js";
 
 const EPSILON = 1e-6;
 const TIMELINE_LEFT = 16;
 const TIMELINE_RIGHT = 12;
+const LYRICS_LANGUAGES = new Set([
+  "auto", "en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh",
+  "ar", "hi", "tr", "pl", "nl", "sv", "no", "da", "fi", "uk", "cs",
+]);
 const DEFAULT_CLIP_GRID_INTERVALS = 4;
 const RENDER_GROUP_COLORS = ["#22d3ee", "#f59e0b", "#34d399", "#f472b6", "#60a5fa"];
 const ENVELOPE_ACCENTS = ["#22d3ee", "#f59e0b", "#a78bfa"];
@@ -48,6 +78,20 @@ const GRID_DENSITY_LABELS = {
   every_beat: "Every beat",
   half_beat: "Half-beat",
 };
+const HISTORY_LIMIT = 50;
+const HISTORY_WIDGETS = [
+  "timeUnit",
+  "fps",
+  "sequenceDuration",
+  "trimStartFrame",
+  "halfTime",
+  "beatOffset",
+  "beatGridDensity",
+  "defaultFadeIn",
+  "defaultFadeOut",
+  "curve",
+  "analysisSource",
+];
 
 function finiteNumber(value, fallback = 0) {
   const parsed = Number(value);
@@ -56,6 +100,19 @@ function finiteNumber(value, fallback = 0) {
 
 function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
+}
+
+function cloneHistoryValue(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function textHash(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 function formatClock(seconds) {
@@ -131,22 +188,42 @@ function audioViewURL(value) {
 }
 
 export class BeatPromptSequencer {
-  constructor({ node, container, widgets, onStateChange = null }) {
+  constructor({ node, container, widgets, onStateChange = null, onHistoryChange = null }) {
     this.node = node;
     this.container = container;
     this.widgets = widgets;
     this.onStateChange = onStateChange;
+    this.onHistoryChange = onHistoryChange;
+    this.undoStack = [];
+    this.redoStack = [];
+    this.historyTransaction = null;
+    this.historyBaseline = null;
+    this.historySuspended = true;
+    this.restoringHistory = false;
+    this.audioHistoryResetPending = false;
     this.clips = [];
     this.selectedIndex = -1;
     this.selectedIndices = new Set();
     this.selectionAnchor = -1;
     this.playheadFrame = null;
     this.clipboardClip = null;
+    this.clipboardSongSection = null;
     this.snapGuideFrame = null;
     this.drag = null;
     this.resnapPending = false;
     this.clipRects = [];
     this.crossfadeRects = [];
+    this.songMapRects = [];
+    this.songMapBoundaryRects = [];
+    this.lyricsRects = [];
+    this.songMapCache = null;
+    this.selectedSongSectionId = null;
+    this.selectedSongSectionIds = new Set();
+    this.songSelectionAnchorId = null;
+    this.editingSongSectionId = null;
+    this.selectedLyricsSegmentId = null;
+    this.activeLane = "prompt";
+    this.rawLane = "prompt";
     this.pendingFrame = null;
     this.resizeObserver = null;
     this.callbackRestorers = [];
@@ -163,6 +240,8 @@ export class BeatPromptSequencer {
     this.sourceAudioDuration = 0;
     this.sourceAnalysis = null;
     this.audioElement = null;
+    this.staticCanvas = document.createElement("canvas");
+    this.staticDirty = true;
     this.audioURL = "";
     this.playbackFrameRequest = null;
     this.analysisTimer = null;
@@ -172,7 +251,15 @@ export class BeatPromptSequencer {
     this.loadingAudio = false;
     this.separationJobId = node._flAudioSeparationJobId || null;
     this.separationTimer = null;
+    this.transcriptionJobId = node._flAudioTranscriptionJobId || null;
+    this.transcriptionTimer = null;
     this.contextMenu = null;
+    this.writerActivity = null;
+    this.writerActivityFrame = null;
+    this.writerActivityTimer = null;
+    this.writerActivityStartedAt = 0;
+    this.writerCompletionFades = new Map();
+    this.writerReducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches || false;
     this.documentPointerHandler = (event) => {
       if (this.contextMenu && !this.contextMenu.contains(event.target)) {
         this.closeContextMenu();
@@ -181,6 +268,24 @@ export class BeatPromptSequencer {
 
     const saved = node.properties?.flBeatPromptSequencer || {};
     const savedCompatible = isCompatibleFormatVersion(saved.formatVersion);
+    this.songMapOverrides = normalizeSongMapOverrides(
+      savedCompatible ? saved.songMapOverrides : null,
+    );
+    this.lyricsTimeline = normalizeLyricsTimeline(savedCompatible ? saved.lyricsTimeline : null);
+    const savedLyricsSettings = savedCompatible ? saved.lyricsSettings || {} : {};
+    this.lyricsSettings = {
+      source: ["auto", "vocals", "mix"].includes(savedLyricsSettings.source)
+        ? savedLyricsSettings.source
+        : "auto",
+      model: ["small", "large-v3-turbo"].includes(savedLyricsSettings.model)
+        ? savedLyricsSettings.model
+        : "large-v3-turbo",
+      language: LYRICS_LANGUAGES.has(String(savedLyricsSettings.language || "auto"))
+        ? String(savedLyricsSettings.language || "auto")
+        : "auto",
+      includeInWriter: savedLyricsSettings.includeInWriter !== false,
+      laneExpanded: savedLyricsSettings.laneExpanded !== false,
+    };
     this.sourceAnalysis = savedCompatible ? sourceAnalysisValue(saved.sourceAnalysis) : null;
     this.beatData = savedCompatible && !this.sourceAnalysis ? saved.beatData || null : null;
     if (this.beatData) {
@@ -201,10 +306,16 @@ export class BeatPromptSequencer {
 
     injectBeatPromptSequencerStyles();
     this.build();
+    this.refreshTranscriptionModelStatus();
+    this.activateLane("prompt");
     this.bindWidgetCallbacks();
     if (this.separationJobId) {
       this.root.querySelector('[data-action="separate"]').textContent = "Cancel separation";
       this.pollSeparation();
+    }
+    if (this.transcriptionJobId) {
+      this.root.querySelector('[data-action="transcribe"]').textContent = "Cancel transcription";
+      this.pollTranscription();
     }
     this.applyBeatOffset();
     this.loadTimeline();
@@ -213,6 +324,9 @@ export class BeatPromptSequencer {
     if (!(this.viewEnd > this.viewStart)) this.zoomToFit(false);
     if (this.widgets.audioFile?.value) this.loadAudioSource();
     this.scheduleDraw();
+    this.historySuspended = false;
+    this.historyBaseline = this.captureHistoryState();
+    this.notifyHistoryChange();
   }
 
   fps() {
@@ -262,6 +376,7 @@ export class BeatPromptSequencer {
         </label>
         <button class="flbps-button" data-action="analyze" title="Analyze beats, onsets, and drums without queueing the workflow">Analyze</button>
         <button class="flbps-button" data-action="separate" title="Explicitly separate and cache stems for analysis">Separate stems</button>
+        <button class="flbps-button" data-action="transcribe" title="Transcribe a timed local lyrics track; the selected model downloads only from this action">Transcribe lyrics</button>
       </div>
       <div class="flbps-toolbar">
         <div class="flbps-control-group">
@@ -297,9 +412,11 @@ export class BeatPromptSequencer {
       <div class="flbps-error" data-role="error"></div>
       <div class="flbps-canvas-wrap">
         <canvas class="flbps-canvas"></canvas>
+        <input class="flbps-song-label-editor" data-role="song-label-editor" type="text" maxlength="48" aria-label="Song Map section name" hidden>
         <div class="flbps-empty" data-role="empty"></div>
       </div>
       <div class="flbps-actions">
+        <span class="flbps-lane-badge" data-role="active-lane">Prompt track</span>
         <button class="flbps-button primary" data-action="add">+ Prompt</button>
         <button class="flbps-button" data-action="split">Split</button>
         <button class="flbps-button" data-action="duplicate">Duplicate</button>
@@ -311,7 +428,7 @@ export class BeatPromptSequencer {
         <button class="flbps-button active" data-inspector-tab="prompt">Timeline prompt</button>
         <button class="flbps-button" data-inspector-tab="envelopes">Reactive envelopes</button>
       </div>
-      <div class="flbps-inspector" data-role="inspector" data-tab="prompt">
+      <div class="flbps-inspector" data-role="inspector" data-tab="prompt" data-lane="prompt">
         <section class="flbps-clip-inspector disabled" data-role="clip-inspector">
           <div class="flbps-inspector-grid">
             <div class="flbps-field"><label>Start frame</label><input data-field="start" type="number" min="0" step="1"></div>
@@ -326,6 +443,41 @@ export class BeatPromptSequencer {
           </div>
           <textarea data-field="prompt" placeholder="Describe what should happen during this frame range."></textarea>
         </section>
+        <section class="flbps-song-inspector disabled" data-role="song-inspector">
+          <div class="flbps-inspector-grid">
+            <div class="flbps-field"><label>Start frame</label><input data-song-field="start" type="number" min="0" step="1"></div>
+            <div class="flbps-field"><label>End frame</label><input data-song-field="end" type="number" min="1" step="1"></div>
+            <div class="flbps-field"><label>Duration</label><input data-song-field="duration" type="text" readonly></div>
+            <div class="flbps-field"><label>Role</label><select data-song-field="role"><option value="unknown">Unknown</option><option value="intro">Intro</option><option value="verse">Verse</option><option value="pre_chorus">Pre-Chorus</option><option value="chorus">Chorus</option><option value="bridge">Bridge</option><option value="instrumental">Instrumental</option><option value="breakdown">Breakdown</option><option value="outro">Outro</option></select></div>
+          </div>
+          <div class="flbps-prompt-label"><span>Song Map section</span><span class="flbps-prompt-meta" data-role="song-meta"></span></div>
+          <div class="flbps-song-summary" data-role="song-summary"></div>
+          <div class="flbps-song-reset-actions">
+            <button class="flbps-button" data-action="reset-song-labels">Reset labels</button>
+            <button class="flbps-button" data-action="reset-song-structure">Reset structure</button>
+            <button class="flbps-button danger" data-action="reset-song-map">Reset all</button>
+          </div>
+        </section>
+        <section class="flbps-lyrics-inspector disabled" data-role="lyrics-inspector">
+          <div class="flbps-inspector-grid">
+            <div class="flbps-field"><label>Start frame</label><input data-lyrics-field="start" type="number" min="0" step="1"></div>
+            <div class="flbps-field"><label>End frame</label><input data-lyrics-field="end" type="number" min="1" step="1"></div>
+            <div class="flbps-field"><label>Duration</label><input data-lyrics-field="duration" type="text" readonly></div>
+            <div class="flbps-field"><label>Source</label><select data-lyrics-setting="source"><option value="auto">Auto: vocals if available</option><option value="vocals">Vocals stem</option><option value="mix">Full mix</option></select></div>
+            <div class="flbps-field"><label>Model</label><select data-lyrics-setting="model"><option value="large-v3-turbo">Whisper Large v3 Turbo</option><option value="small">Whisper Small</option></select></div>
+            <div class="flbps-field"><label>Language</label><select data-lyrics-setting="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="de">German</option><option value="it">Italian</option><option value="pt">Portuguese</option><option value="ru">Russian</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="zh">Chinese</option><option value="ar">Arabic</option><option value="hi">Hindi</option><option value="tr">Turkish</option><option value="pl">Polish</option><option value="nl">Dutch</option><option value="sv">Swedish</option><option value="no">Norwegian</option><option value="da">Danish</option><option value="fi">Finnish</option><option value="uk">Ukrainian</option><option value="cs">Czech</option></select></div>
+          </div>
+          <div class="flbps-prompt-label"><span>Timed lyrics</span><span class="flbps-prompt-meta" data-role="lyrics-meta"></span></div>
+          <textarea data-lyrics-field="text" maxlength="1000" placeholder="Select a lyric segment, transcribe the song, or import timed lyrics."></textarea>
+          <div class="flbps-lyrics-controls">
+            <label class="flbps-auto" title="Timed lyric text is sent with prompt boxes; audio is never sent"><input data-lyrics-setting="include-writer" type="checkbox"> Include timed lyrics in Beat Writer</label>
+            <span class="flbps-spacer"></span>
+            <button class="flbps-button" data-action="import-lyrics">Import LRC/SRT</button>
+            <button class="flbps-button" data-action="reset-lyrics">Reset from transcription</button>
+            <button class="flbps-button danger" data-action="discard-lyrics">Discard lyrics</button>
+          </div>
+          <div class="flbps-lyrics-status" data-role="lyrics-status">No timed lyrics yet.</div>
+        </section>
         <section class="flbps-envelope-panel" data-role="envelope-panel">
           <div class="flbps-envelope-header">
             <span class="flbps-envelope-title">Reactive prompt envelopes</span>
@@ -337,7 +489,7 @@ export class BeatPromptSequencer {
         </section>
       </div>
       <div class="flbps-raw" data-role="raw-panel">
-        <div class="flbps-raw-label">Advanced frame schedule. All positions, fades, and crossfades must be integer frames.</div>
+        <div class="flbps-raw-label" data-role="raw-label">Advanced frame schedule. All positions, fades, and crossfades must be integer frames.</div>
         <textarea data-role="raw-text"></textarea>
         <div class="flbps-raw-actions">
           <button class="flbps-button" data-action="raw-cancel">Close</button>
@@ -345,7 +497,7 @@ export class BeatPromptSequencer {
         </div>
       </div>
       <div class="flbps-footer">
-        <span>Ctrl/Cmd+C copy · Ctrl/Cmd+V paste at playhead · Ctrl/Cmd+D duplicate · Shift/Ctrl select prompts · Space play/pause</span>
+        <span>Ctrl/Cmd+Z undo · Ctrl/Cmd+Shift+Z redo · Ctrl/Cmd+C copy · Ctrl/Cmd+V paste at playhead · Ctrl/Cmd+D duplicate · Shift/Ctrl select prompts · Space play/pause</span>
       </div>
     `;
     this.container.appendChild(this.root);
@@ -354,14 +506,23 @@ export class BeatPromptSequencer {
     this.errorEl = this.root.querySelector('[data-role="error"]');
     this.emptyEl = this.root.querySelector('[data-role="empty"]');
     this.canvas = this.root.querySelector(".flbps-canvas");
+    this.songLabelEditor = this.root.querySelector('[data-role="song-label-editor"]');
     this.inspector = this.root.querySelector('[data-role="inspector"]');
     this.clipInspector = this.root.querySelector('[data-role="clip-inspector"]');
+    this.songInspector = this.root.querySelector('[data-role="song-inspector"]');
+    this.lyricsInspector = this.root.querySelector('[data-role="lyrics-inspector"]');
+    this.activeLaneEl = this.root.querySelector('[data-role="active-lane"]');
     this.envelopePanel = this.root.querySelector('[data-role="envelope-panel"]');
     this.envelopeCards = this.root.querySelector('[data-role="envelope-cards"]');
     this.addEnvelopeButton = this.root.querySelector('[data-action="add-envelope"]');
     this.rawPanel = this.root.querySelector('[data-role="raw-panel"]');
     this.rawText = this.root.querySelector('[data-role="raw-text"]');
+    this.rawLabel = this.root.querySelector('[data-role="raw-label"]');
     this.promptMetaEl = this.root.querySelector('[data-role="prompt-meta"]');
+    this.songMetaEl = this.root.querySelector('[data-role="song-meta"]');
+    this.songSummaryEl = this.root.querySelector('[data-role="song-summary"]');
+    this.lyricsMetaEl = this.root.querySelector('[data-role="lyrics-meta"]');
+    this.lyricsStatusEl = this.root.querySelector('[data-role="lyrics-status"]');
     this.transportTimeEl = this.root.querySelector('[data-role="transport-time"]');
     this.sourceLabelEl = this.root.querySelector('[data-role="source-label"]');
     this.controls = {
@@ -383,6 +544,27 @@ export class BeatPromptSequencer {
       crossfade: this.root.querySelector('[data-field="crossfade"]'),
       prompt: this.root.querySelector('[data-field="prompt"]'),
     };
+    this.songFields = {
+      start: this.root.querySelector('[data-song-field="start"]'),
+      end: this.root.querySelector('[data-song-field="end"]'),
+      duration: this.root.querySelector('[data-song-field="duration"]'),
+      role: this.root.querySelector('[data-song-field="role"]'),
+    };
+    this.lyricsFields = {
+      start: this.root.querySelector('[data-lyrics-field="start"]'),
+      end: this.root.querySelector('[data-lyrics-field="end"]'),
+      duration: this.root.querySelector('[data-lyrics-field="duration"]'),
+      text: this.root.querySelector('[data-lyrics-field="text"]'),
+      source: this.root.querySelector('[data-lyrics-setting="source"]'),
+      model: this.root.querySelector('[data-lyrics-setting="model"]'),
+      language: this.root.querySelector('[data-lyrics-setting="language"]'),
+      includeInWriter: this.root.querySelector('[data-lyrics-setting="include-writer"]'),
+    };
+    this.lyricsImportInput = document.createElement("input");
+    this.lyricsImportInput.type = "file";
+    this.lyricsImportInput.accept = ".lrc,.srt,application/x-subrip,text/plain";
+    this.lyricsImportInput.hidden = true;
+    this.root.appendChild(this.lyricsImportInput);
     this.editButtons = [
       ...this.root.querySelectorAll('[data-action="add"], [data-action="split"], [data-action="duplicate"], [data-action="delete"]'),
     ];
@@ -390,7 +572,7 @@ export class BeatPromptSequencer {
     for (const button of this.root.querySelectorAll("[data-inspector-tab]")) {
       button.addEventListener("click", () => this.setInspectorTab(button.dataset.inspectorTab));
     }
-    this.addEnvelopeButton.addEventListener("click", () => this.addEnvelope());
+    this.addEnvelopeButton.addEventListener("click", () => this.runEdit("Add envelope", () => this.addEnvelope()));
     this.renderEnvelopeEditor();
 
     this.controls.beatGridDensity.value = this.beatGridDensity();
@@ -398,29 +580,48 @@ export class BeatPromptSequencer {
     this.syncBeatOffsetControls();
     this.syncPlaybackVolumeControl();
     this.controls.beatGridDensity.addEventListener("change", () => {
-      this.setBeatGridDensity(this.controls.beatGridDensity.value);
+      this.runEdit("Change beat grid density", () => {
+        this.setBeatGridDensity(this.controls.beatGridDensity.value);
+      });
     });
     this.controls.autoAnalyze.addEventListener("change", () => {
       this.autoAnalyze = this.controls.autoAnalyze.checked;
-      this.saveViewState();
+      this.saveViewState(false);
       if (this.autoAnalyze) this.requestAnalysis();
     });
+    const beginBeatOffsetEdit = () => {
+      if (!this.historyTransaction) this.beginEdit("Change beat offset");
+    };
+    this.controls.beatOffset.addEventListener("pointerdown", beginBeatOffsetEdit);
+    this.controls.beatOffset.addEventListener("focus", beginBeatOffsetEdit);
     this.controls.beatOffset.addEventListener("input", () => {
+      beginBeatOffsetEdit();
       this.setBeatOffset(this.controls.beatOffset.value);
     });
     this.controls.beatOffset.addEventListener("change", () => {
       this.setBeatOffset(this.controls.beatOffset.value, true, true);
     });
+    const finishBeatOffsetEdit = () => {
+      this.setBeatOffset(this.controls.beatOffset.value, true, true);
+      this.commitEdit();
+    };
+    this.controls.beatOffset.addEventListener("pointerup", finishBeatOffsetEdit);
+    this.controls.beatOffset.addEventListener("pointercancel", finishBeatOffsetEdit);
+    this.controls.beatOffset.addEventListener("blur", () => this.commitEdit());
+    this.controls.beatOffsetNumber.addEventListener("focus", beginBeatOffsetEdit);
     this.controls.beatOffsetNumber.addEventListener("input", () => {
       if (this.controls.beatOffsetNumber.value !== "") {
+        beginBeatOffsetEdit();
         this.setBeatOffset(this.controls.beatOffsetNumber.value);
       }
     });
     this.controls.beatOffsetNumber.addEventListener("change", () => {
       this.setBeatOffset(this.controls.beatOffsetNumber.value, true, true);
+      this.commitEdit();
     });
+    this.controls.beatOffsetNumber.addEventListener("blur", () => this.commitEdit());
     this.root.querySelector('[data-action="reset-offset"]').addEventListener("click", () => {
-      this.setBeatOffset(0, true, true);
+      this.runEdit("Reset beat offset", () => this.setBeatOffset(0, true, true));
     });
     this.root.querySelector('[data-action="play"]').addEventListener("click", () => this.togglePlayback());
     this.root.querySelector('[data-action="stop"]').addEventListener("click", () => this.stopPlayback());
@@ -432,18 +633,85 @@ export class BeatPromptSequencer {
     });
     this.root.querySelector('[data-action="analyze"]').addEventListener("click", () => this.requestAnalysis(true));
     this.root.querySelector('[data-action="separate"]').addEventListener("click", () => this.startSeparation());
-    this.root.querySelector('[data-action="add"]').addEventListener("click", () => this.addClip());
-    this.root.querySelector('[data-action="split"]').addEventListener("click", () => this.splitClip());
-    this.root.querySelector('[data-action="duplicate"]').addEventListener("click", () => this.duplicateClip());
-    this.root.querySelector('[data-action="delete"]').addEventListener("click", () => this.deleteClip());
+    this.root.querySelector('[data-action="transcribe"]').addEventListener("click", () => this.startTranscription());
+    this.root.querySelector('[data-action="add"]').addEventListener("click", () => this.runEdit(
+      this.activeLane === "song-map" ? "Add Song Map section" :
+        this.activeLane === "lyrics" ? "Add lyric" : "Add prompt",
+      () => this.activeLane === "song-map" ? this.addSongSection() :
+        this.activeLane === "lyrics" ? this.addLyricsSegment() : this.addClip(),
+    ));
+    this.root.querySelector('[data-action="split"]').addEventListener("click", () => this.runEdit(
+      this.activeLane === "song-map" ? "Split Song Map section" :
+        this.activeLane === "lyrics" ? "Split lyric" : "Split prompt",
+      () => this.activeLane === "song-map" ? this.splitSongSection() :
+        this.activeLane === "lyrics" ? this.splitLyricsSegment() : this.splitClip(),
+    ));
+    this.root.querySelector('[data-action="duplicate"]').addEventListener("click", () => this.runEdit(
+      this.activeLane === "song-map" ? "Duplicate Song Map section" :
+        this.activeLane === "lyrics" ? "Merge lyrics" : "Duplicate prompt",
+      () => this.activeLane === "song-map" ? this.duplicateSongSection() :
+        this.activeLane === "lyrics" ? this.mergeLyricsSegment() : this.duplicateClip(),
+    ));
+    this.root.querySelector('[data-action="delete"]').addEventListener("click", () => this.runEdit(
+      this.activeLane === "song-map" ? "Delete Song Map section" :
+        this.activeLane === "lyrics" ? "Delete lyric" : "Delete prompt",
+      () => this.activeLane === "song-map" ? this.deleteSongSection() :
+        this.activeLane === "lyrics" ? this.deleteLyricsSegment() : this.deleteClip(),
+    ));
     this.root.querySelector('[data-action="raw"]').addEventListener("click", () => this.toggleRaw());
     this.root.querySelector('[data-action="raw-cancel"]').addEventListener("click", () => this.toggleRaw(false));
-    this.root.querySelector('[data-action="raw-apply"]').addEventListener("click", () => this.applyRaw());
+    this.root.querySelector('[data-action="raw-apply"]').addEventListener("click", () => this.runEdit(
+      this.rawLane === "song-map" ? "Apply raw Song Map" : "Apply raw prompt schedule",
+      () => this.applyRaw(),
+    ));
 
     for (const name of ["start", "end", "fadeIn", "fadeOut", "crossfade"]) {
-      this.fields[name].addEventListener("change", () => this.applyInspectorTiming());
+      this.fields[name].addEventListener("change", () => this.runEdit("Edit prompt timing", () => this.applyInspectorTiming()));
     }
+    for (const name of ["start", "end", "role"]) {
+      this.songFields[name].addEventListener("change", () => this.runEdit("Edit Song Map section", () => this.applySongInspector()));
+    }
+    for (const name of ["start", "end"]) {
+      this.lyricsFields[name].addEventListener("change", () => this.runEdit("Edit lyric timing", () => this.applyLyricsInspector()));
+    }
+    this.lyricsFields.text.addEventListener("change", () => this.runEdit("Edit lyric text", () => this.applyLyricsText()));
+    for (const name of ["source", "model", "language"]) {
+      this.lyricsFields[name].addEventListener("change", () => {
+        this.lyricsSettings[name] = this.lyricsFields[name].value;
+        this.saveViewState(false);
+        this.refreshTranscriptionModelStatus();
+      });
+    }
+    this.lyricsFields.includeInWriter.addEventListener("change", () => {
+      this.runEdit("Change Writer lyrics context", () => {
+        this.lyricsSettings.includeInWriter = this.lyricsFields.includeInWriter.checked;
+        this.saveViewState();
+        this.syncLyricsInspector();
+      });
+    });
+    this.root.querySelector('[data-action="import-lyrics"]').addEventListener("click", () => this.lyricsImportInput.click());
+    this.lyricsImportInput.addEventListener("change", () => this.importLyricsFile());
+    this.root.querySelector('[data-action="reset-lyrics"]').addEventListener("click", () => this.resetLyricsFromCache());
+    this.root.querySelector('[data-action="discard-lyrics"]').addEventListener("click", () => this.discardLyrics());
+    this.songLabelEditor.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        this.finishSongLabelEdit(true);
+        event.preventDefault();
+        event.stopPropagation();
+      } else if (event.key === "Escape") {
+        this.finishSongLabelEdit(false);
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+    this.songLabelEditor.addEventListener("blur", () => this.finishSongLabelEdit(true));
+    this.root.querySelector('[data-action="reset-song-labels"]').addEventListener("click", () => this.runEdit("Reset Song Map labels", () => this.resetSongLabels()));
+    this.root.querySelector('[data-action="reset-song-structure"]').addEventListener("click", () => this.runEdit("Reset Song Map structure", () => this.resetSongStructure()));
+    this.root.querySelector('[data-action="reset-song-map"]').addEventListener("click", () => this.runEdit("Reset Song Map", () => this.resetEntireSongMap()));
+    this.fields.prompt.addEventListener("focus", () => this.beginEdit("Edit prompt text"));
+    this.fields.prompt.addEventListener("blur", () => this.commitEdit());
     this.fields.prompt.addEventListener("input", () => {
+      if (!this.historyTransaction) this.beginEdit("Edit prompt text");
       const clip = this.selectedClip();
       if (!clip) return;
       clip.prompt = this.fields.prompt.value;
@@ -507,15 +775,21 @@ export class BeatPromptSequencer {
       this.markDirty();
     });
     bind(this.widgets.audioFile, () => {
+      this.audioHistoryResetPending = true;
+      this.clearHistory();
       if (this.widgets.analysisCacheKey) this.widgets.analysisCacheKey.value = "";
       this.loadAudioSource();
+      this.syncLyricsInspector();
+      this.scheduleDraw();
     });
     bind(this.widgets.trimStartFrame, () => {
       this.refreshBrowserCrop();
+      this.syncLyricsInspector();
     });
     bind(this.widgets.halfTime, () => {
       this.refreshBrowserCrop();
       this.resnapClipsToGrid();
+      this.resnapSongMapToGrid();
       this.markDirty();
     });
     bind(this.widgets.beatOffset, (value) => this.setBeatOffset(value, false, true));
@@ -529,7 +803,269 @@ export class BeatPromptSequencer {
     bind(this.widgets.curve, () => this.markDirty());
   }
 
-  markDirty() {
+  captureHistorySelection() {
+    return {
+      activeLane: this.activeLane,
+      inspectorTab: this.inspectorTab,
+      selectedIndex: this.selectedIndex,
+      selectedIndices: [...(this.selectedIndices || [])],
+      selectionAnchor: this.selectionAnchor,
+      selectedSongSectionId: this.selectedSongSectionId,
+      selectedSongSectionIds: [...(this.selectedSongSectionIds || [])],
+      songSelectionAnchorId: this.songSelectionAnchorId,
+      selectedLyricsSegmentId: this.selectedLyricsSegmentId,
+    };
+  }
+
+  captureHistoryState() {
+    const widgetValues = {};
+    for (const name of HISTORY_WIDGETS) widgetValues[name] = cloneHistoryValue(this.widgets?.[name]?.value);
+    return {
+      clips: cloneHistoryValue(this.clips || []),
+      songMapOverrides: cloneHistoryValue(this.songMapOverrides),
+      lyricsTimeline: cloneHistoryValue(lyricsTimelineForStorage(this.lyricsTimeline)),
+      envelopeSlots: cloneHistoryValue(this.envelopeSlots || [null, null, null]),
+      lyricsIncludeInWriter: this.lyricsSettings?.includeInWriter !== false,
+      widgetValues,
+      selection: this.captureHistorySelection(),
+    };
+  }
+
+  historyStateKey(state) {
+    if (!state) return "";
+    return JSON.stringify({
+      clips: state.clips,
+      songMapOverrides: state.songMapOverrides,
+      lyricsTimeline: state.lyricsTimeline,
+      envelopeSlots: state.envelopeSlots,
+      lyricsIncludeInWriter: state.lyricsIncludeInWriter,
+      widgetValues: state.widgetValues,
+    });
+  }
+
+  notifyHistoryChange() {
+    this.onHistoryChange?.({
+      canUndo: this.canUndo(),
+      canRedo: this.canRedo(),
+      undoLabel: this.nextUndoLabel(),
+      redoLabel: this.nextRedoLabel(),
+    });
+  }
+
+  beginEdit(label, options = {}) {
+    if (this.historySuspended !== false || this.restoringHistory) return;
+    if (this.audioHistoryResetPending) {
+      this.audioHistoryResetPending = false;
+      this.clearHistory();
+    }
+    if (this.historyTransaction) {
+      this.historyTransaction.depth++;
+      return;
+    }
+    this.historyTransaction = {
+      label: String(label || "Edit sequencer"),
+      before: this.captureHistoryState(),
+      depth: 1,
+      kind: options.kind || "edit",
+      count: finiteNumber(options.count, 0),
+      mergeKey: options.mergeKey || "",
+    };
+  }
+
+  commitEdit(metadata = null) {
+    const transaction = this.historyTransaction;
+    if (!transaction) return false;
+    if (--transaction.depth > 0) return false;
+    this.historyTransaction = null;
+    if (metadata) Object.assign(transaction, metadata);
+    const after = this.captureHistoryState();
+    if (this.historyStateKey(transaction.before) === this.historyStateKey(after)) {
+      this.historyBaseline = after;
+      return false;
+    }
+    this.pushHistoryEntry({ ...transaction, after });
+    return true;
+  }
+
+  cancelEdit() {
+    const transaction = this.historyTransaction;
+    if (!transaction) return;
+    this.historyTransaction = null;
+    if (this.historyStateKey(transaction.before) !== this.historyStateKey(this.captureHistoryState())) {
+      this.restoreHistoryState(transaction.before);
+    } else {
+      this.historyBaseline = this.captureHistoryState();
+    }
+  }
+
+  runEdit(label, callback, options = {}) {
+    if (this.historySuspended !== false || this.restoringHistory) return callback();
+    if (options.isolated) {
+      while (this.historyTransaction) this.commitEdit();
+    }
+    this.beginEdit(label, options);
+    try {
+      return callback();
+    } finally {
+      this.commitEdit();
+    }
+  }
+
+  pushHistoryEntry(entry) {
+    this.undoStack ||= [];
+    this.redoStack ||= [];
+    const now = performance.now();
+    const previous = this.undoStack.at(-1);
+    if (entry.mergeKey && previous?.mergeKey === entry.mergeKey && now - previous.timestamp < 700) {
+      previous.after = entry.after;
+      previous.label = entry.label;
+      previous.kind = entry.kind;
+      previous.count = entry.count;
+      previous.timestamp = now;
+    } else {
+      this.undoStack.push({ ...entry, timestamp: now });
+      if (this.undoStack.length > HISTORY_LIMIT) this.undoStack.shift();
+    }
+    this.redoStack = [];
+    this.historyBaseline = entry.after;
+    this.notifyHistoryChange();
+  }
+
+  recordHistoryMutation(label = "Edit sequencer") {
+    if (this.historySuspended !== false || this.restoringHistory || this.historyTransaction) return;
+    const after = this.captureHistoryState();
+    if (this.audioHistoryResetPending) {
+      this.historyBaseline = after;
+      return;
+    }
+    const before = this.historyBaseline || after;
+    if (this.historyStateKey(before) === this.historyStateKey(after)) {
+      this.historyBaseline = after;
+      return;
+    }
+    this.pushHistoryEntry({ label, before, after, kind: "edit", count: 0, mergeKey: "" });
+  }
+
+  clearHistory() {
+    this.historyTransaction = null;
+    this.undoStack = [];
+    this.redoStack = [];
+    this.historyBaseline = this.captureHistoryState();
+    this.notifyHistoryChange();
+  }
+
+  canUndo() {
+    return Boolean(this.undoStack?.length);
+  }
+
+  canRedo() {
+    return Boolean(this.redoStack?.length);
+  }
+
+  nextUndoLabel() {
+    return this.undoStack?.at(-1)?.label || "";
+  }
+
+  nextRedoLabel() {
+    return this.redoStack?.at(-1)?.label || "";
+  }
+
+  restoreHistoryState(state) {
+    if (!state) return;
+    const previousAnalysisSource = this.widgets.analysisSource?.value;
+    this.restoringHistory = true;
+    try {
+      this.closeContextMenu();
+      this.editingSongSectionId = null;
+      this.songLabelEditor.hidden = true;
+      this.toggleRaw(false);
+      for (const [name, value] of Object.entries(state.widgetValues || {})) {
+        if (this.widgets[name]) this.widgets[name].value = cloneHistoryValue(value);
+      }
+      this.clips = normalizeCrossfades(cloneHistoryValue(state.clips || []));
+      this.songMapOverrides = normalizeSongMapOverrides(cloneHistoryValue(state.songMapOverrides));
+      this.lyricsTimeline = normalizeLyricsTimeline(cloneHistoryValue(state.lyricsTimeline));
+      this.envelopeSlots = cloneHistoryValue(state.envelopeSlots || [null, null, null]);
+      this.lyricsSettings.includeInWriter = state.lyricsIncludeInWriter !== false;
+
+      const selection = state.selection || {};
+      this.selectedIndex = Number.isInteger(selection.selectedIndex) ? selection.selectedIndex : -1;
+      this.selectedIndices = new Set(selection.selectedIndices || []);
+      this.selectionAnchor = Number.isInteger(selection.selectionAnchor) ? selection.selectionAnchor : this.selectedIndex;
+      this.selectedSongSectionId = selection.selectedSongSectionId || null;
+      this.selectedSongSectionIds = new Set(selection.selectedSongSectionIds || []);
+      this.songSelectionAnchorId = selection.songSelectionAnchorId || null;
+      this.selectedLyricsSegmentId = selection.selectedLyricsSegmentId || null;
+      this.rawInvalid = false;
+      this.migrationPending = false;
+
+      const duration = this.sequenceFrameCount();
+      if (!(this.viewEnd > this.viewStart) || this.viewStart >= duration || this.viewEnd > duration) {
+        this.viewStart = 0;
+        this.viewEnd = duration;
+      }
+      if (this.playheadFrame != null) this.playheadFrame = clamp(this.playheadFrame, 0, duration);
+
+      if (this.widgets.timeline) this.widgets.timeline.value = serializeTimeline(this.clips);
+      if (this.widgets.renderGroups) this.widgets.renderGroups.value = serializeRenderGroups(this.clips);
+      if (this.widgets.envelopeLayers) this.widgets.envelopeLayers.value = serializeEnvelopeLayers(this.envelopeSlots);
+      this.rawText.value = this.widgets.timeline?.value || "";
+      if (this.widgets.analysisSource?.value !== previousAnalysisSource) {
+        this.invalidateAnalysis();
+        this.scheduleAnalysis();
+      }
+      this.applyBeatOffset();
+      this.refreshBrowserCrop();
+      this.renderEnvelopeEditor();
+      this.saveViewState();
+      this.setEditorEnabled(true);
+      this.clearError();
+      this.activateLane(selection.activeLane || "prompt");
+      this.setInspectorTab(selection.inspectorTab || "prompt");
+      this.syncBeatOffsetControls();
+      if (this.controls?.beatGridDensity) this.controls.beatGridDensity.value = this.beatGridDensity();
+      this.syncInspector();
+      this.scheduleDraw();
+    } finally {
+      this.restoringHistory = false;
+    }
+    this.historyBaseline = this.captureHistoryState();
+    this.node.graph?.change?.();
+    this.onStateChange?.();
+  }
+
+  undo() {
+    while (this.historyTransaction) this.commitEdit();
+    const entry = this.undoStack.pop();
+    if (!entry) return false;
+    this.redoStack.push(entry);
+    this.restoreHistoryState(entry.before);
+    this.notifyHistoryChange();
+    return true;
+  }
+
+  redo() {
+    while (this.historyTransaction) this.commitEdit();
+    const entry = this.redoStack.pop();
+    if (!entry) return false;
+    this.undoStack.push(entry);
+    this.restoreHistoryState(entry.after);
+    this.notifyHistoryChange();
+    return true;
+  }
+
+  commitFocusedEdit() {
+    const active = document.activeElement;
+    if (active && this.root.contains(active) &&
+        (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active.isContentEditable)) {
+      active.blur();
+    }
+    while (this.historyTransaction) this.commitEdit();
+  }
+
+  markDirty(recordHistory = true) {
+    if (this.restoringHistory) return;
+    if (recordHistory) this.recordHistoryMutation();
     this.node.graph?.change?.();
     this.onStateChange?.();
   }
@@ -804,7 +1340,10 @@ export class BeatPromptSequencer {
       this.widgets.beatOffset.value = offset;
     }
     this.applyBeatOffset();
-    if (resnap) this.resnapClipsToGrid();
+    if (resnap) {
+      this.resnapClipsToGrid();
+      this.resnapSongMapToGrid();
+    }
     this.markDirty();
   }
 
@@ -816,14 +1355,18 @@ export class BeatPromptSequencer {
     }
     this.applyBeatOffset();
     this.resnapClipsToGrid();
+    this.resnapSongMapToGrid();
     this.markDirty();
   }
 
-  saveViewState() {
+  saveViewState(recordHistory = true) {
     this.node.properties = this.node.properties || {};
     const savedBeatData = this.beatData ? { ...this.beatData, waveformPreview: null } : null;
+    const savedSongMap = this.sourceAnalysis?.songMap
+      ? { ...this.sourceAnalysis.songMap, energyPreview: null }
+      : null;
     const savedSourceAnalysis = this.sourceAnalysis
-      ? { ...this.sourceAnalysis, waveformPreview: null }
+      ? { ...this.sourceAnalysis, waveformPreview: null, songMap: savedSongMap }
       : null;
     const previous = { ...(this.node.properties.flBeatPromptSequencer || {}) };
     delete previous.magnetMode;
@@ -838,8 +1381,118 @@ export class BeatPromptSequencer {
       viewEnd: this.viewEnd,
       autoAnalyze: this.autoAnalyze,
       playbackVolume: this.playbackVolume,
+      songMapOverrides: this.songMapOverrides,
+      lyricsTimeline: lyricsTimelineForStorage(this.lyricsTimeline),
+      lyricsSettings: { ...this.lyricsSettings },
     };
-    this.markDirty();
+    this.markDirty(recordHistory);
+  }
+
+  songMap() {
+    const source = this.sourceAnalysis;
+    if (this.songMapCache?.source === source &&
+        this.songMapCache.overrides === this.songMapOverrides) {
+      return this.songMapCache.value;
+    }
+    const value = applySongMapOverrides(
+      this.sourceAnalysis?.songMap,
+      this.songMapOverrides,
+      this.sourceAnalysis,
+    );
+    this.songMapCache = { source, overrides: this.songMapOverrides, value };
+    return value;
+  }
+
+  songMapRevision() {
+    const songMap = this.songMap();
+    return songMap
+      ? `${songMap.cacheKey}:${textHash(JSON.stringify(this.songMapOverrides))}`
+      : "";
+  }
+
+  lyricsWriterContext() {
+    return createLyricsWriterContext(this.lyricsTimeline, this.clips, {
+      fps: this.fps(),
+      cropStart: this.cropStartSeconds(),
+      totalFrames: this.sequenceFrameCount(),
+      audioFile: String(this.widgets?.audioFile?.value || ""),
+      includeInWriter: this.lyricsSettings.includeInWriter,
+    });
+  }
+
+  activateLane(lane) {
+    this.activeLane = ["song-map", "lyrics"].includes(lane) ? lane : "prompt";
+    this.root.dataset.activeLane = this.activeLane;
+    this.inspector.dataset.lane = this.activeLane;
+    const labels = {
+      prompt: ["Prompt track", "Timeline prompt", "+ Prompt", "Duplicate"],
+      "song-map": ["Song Map", "Song Map section", "+ Section", "Duplicate"],
+      lyrics: ["Lyrics", "Lyrics segment", "+ Lyric", "Merge next"],
+    }[this.activeLane];
+    this.activeLaneEl.textContent = labels[0];
+    this.root.querySelector('[data-inspector-tab="prompt"]').textContent = labels[1];
+    this.root.querySelector('[data-action="add"]').textContent = labels[2];
+    this.root.querySelector('[data-action="duplicate"]').textContent = labels[3];
+    this.root.querySelector('[data-action="raw"]').disabled = this.activeLane === "lyrics";
+    this.syncInspector();
+  }
+
+  lyricsCurrent() {
+    return isLyricsTimelineCurrent(this.lyricsTimeline, this.widgets.audioFile?.value);
+  }
+
+  selectedLyricsSegment() {
+    return this.lyricsTimeline?.segments.find(segment => segment.id === this.selectedLyricsSegmentId) || null;
+  }
+
+  lyricsSegmentLocalRange(segment) {
+    const cropStart = this.cropStartSeconds();
+    return {
+      start: Math.round((segment.start - cropStart) * this.fps()),
+      end: Math.round((segment.end - cropStart) * this.fps()),
+    };
+  }
+
+  selectLyricsSegment(id) {
+    this.selectedLyricsSegmentId = this.lyricsTimeline?.segments.some(segment => segment.id === id)
+      ? id
+      : null;
+    this.activateLane("lyrics");
+    this.scheduleDraw();
+  }
+
+  persistLyrics(segments, selectedId = this.selectedLyricsSegmentId) {
+    const ordered = segments.map(segment => ({ ...segment })).sort((left, right) => left.start - right.start);
+    validateLyricsSegments(ordered);
+    const base = this.lyricsTimeline || {
+      version: 1,
+      audioFile: String(this.widgets.audioFile?.value || ""),
+      audioSha256: "",
+      cacheKey: "",
+      modelId: "",
+      modelRevision: "",
+      requestedLanguage: this.lyricsSettings.language,
+      detectedLanguage: "",
+      audioSource: "manual",
+    };
+    this.lyricsTimeline = normalizeLyricsTimeline({
+      ...(lyricsTimelineForStorage(base) || {
+        version: 1,
+        model_id: base.modelId,
+        model_revision: base.modelRevision,
+        requested_language: base.requestedLanguage,
+        detected_language: base.detectedLanguage,
+        audio_source: base.audioSource,
+      }),
+      audio_file: String(this.widgets.audioFile?.value || base.audioFile || ""),
+      segments: ordered,
+    });
+    this.selectedLyricsSegmentId = this.lyricsTimeline?.segments.some(segment => segment.id === selectedId)
+      ? selectedId
+      : null;
+    this.saveViewState();
+    this.syncLyricsInspector();
+    this.scheduleDraw();
   }
 
   trimStartFrame() {
@@ -987,6 +1640,30 @@ export class BeatPromptSequencer {
     this.invalidateEnvelopePreviews();
   }
 
+  applySourceDuration(duration) {
+    if (!(duration > 0)) return;
+    this.sourceAudioDuration = duration;
+    const sourceFrames = Math.floor(duration * this.fps());
+    const availableFrames = Math.max(1, sourceFrames - this.trimStartFrame());
+    let settingsChanged = false;
+    if (this.trimStartFrame() >= sourceFrames) {
+      this.widgets.trimStartFrame.value = 0;
+      settingsChanged = true;
+    }
+    if (!this.configuredFrameCount() || this.configuredFrameCount() > availableFrames) {
+      this.widgets.sequenceDuration.value = Math.max(
+        1,
+        Math.floor((duration - this.cropStartSeconds()) * this.fps()),
+      );
+      settingsChanged = true;
+    }
+    if (settingsChanged) {
+      this.node.graph?.change?.();
+      this.onStateChange?.();
+      this.clearHistory();
+    }
+  }
+
   async loadAudioSource() {
     const filename = String(this.widgets.audioFile?.value || "");
     const request = ++this.analysisRequest;
@@ -1006,54 +1683,37 @@ export class BeatPromptSequencer {
 
     this.loadingAudio = true;
     this.sourceLabelEl.textContent = filename;
-    this.setStatus("Decoding waveform…");
+    this.setStatus("Loading audio…");
     const url = audioViewURL(filename);
     try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`Audio preview request failed (${response.status}).`);
-      const bytes = await response.arrayBuffer();
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) throw new Error("This browser does not support audio waveform decoding.");
-      const context = new AudioContextClass();
-      let buffer;
-      try {
-        buffer = await context.decodeAudioData(bytes);
-      } finally {
-        await context.close();
-      }
-      if (request !== this.analysisRequest) return;
-
-      this.sourceAudioDuration = buffer.duration;
-      this.sourceWaveformPreview = waveformPreviewFromBuffer(buffer);
-      const availableFrames = Math.max(1, Math.floor(buffer.duration * this.fps()) - this.trimStartFrame());
-      let settingsChanged = false;
-      if (this.trimStartFrame() >= Math.floor(buffer.duration * this.fps())) {
-        this.widgets.trimStartFrame.value = 0;
-        settingsChanged = true;
-      }
-      if (!this.configuredFrameCount() || this.configuredFrameCount() > availableFrames) {
-        this.widgets.sequenceDuration.value = Math.max(
-          1,
-          Math.floor((buffer.duration - this.cropStartSeconds()) * this.fps()),
-        );
-        settingsChanged = true;
-      }
-      if (settingsChanged) this.markDirty();
       this.audioURL = url;
-      this.audioElement = new Audio(url);
-      this.audioElement.preload = "auto";
-      this.audioElement.volume = this.playbackVolume;
-      this.audioElement.addEventListener("timeupdate", () => this.updatePlaybackPosition());
-      this.audioElement.addEventListener("pause", () => {
+      const audioElement = new Audio();
+      this.audioElement = audioElement;
+      audioElement.preload = "metadata";
+      audioElement.volume = this.playbackVolume;
+      audioElement.addEventListener("loadedmetadata", () => {
+        if (this.audioElement !== audioElement) return;
+        this.applySourceDuration(audioElement.duration);
+        this.refreshBrowserCrop();
+        this.zoomToFit(false);
+      });
+      audioElement.addEventListener("error", () => {
+        if (this.audioElement !== audioElement) return;
+        this.showError("Audio preview could not be loaded. Server analysis will still be used.");
+      });
+      audioElement.addEventListener("timeupdate", () => this.updatePlaybackPosition());
+      audioElement.addEventListener("pause", () => {
         this.stopPlaybackLoop();
-        if (!this.audioElement.ended) this.updatePlaybackPosition();
+        if (!audioElement.ended) this.updatePlaybackPosition();
         this.updatePlayButton();
       });
-      this.audioElement.addEventListener("play", () => {
+      audioElement.addEventListener("play", () => {
         this.updatePlayButton();
         this.startPlaybackLoop();
       });
-      this.audioElement.addEventListener("ended", () => this.loopPlayback(true));
+      audioElement.addEventListener("ended", () => this.loopPlayback(true));
+      audioElement.src = url;
+      audioElement.load();
       if (this.sourceAnalysis?.audioFile !== filename ||
           this.sourceAnalysis?.analysisSource !== (this.widgets.analysisSource?.value || "mix")) {
         this.invalidateAnalysis();
@@ -1109,6 +1769,7 @@ export class BeatPromptSequencer {
       const completeSource = this.applyAnalysis(payload, true);
       if (this.migrationPending) this.loadTimeline();
       this.resnapClipsToGrid();
+      this.resnapSongMapToGrid();
       if (completeSource) {
         this.clearError();
       } else {
@@ -1132,6 +1793,8 @@ export class BeatPromptSequencer {
     const sourceAnalysis = sourceAnalysisValue(payload.source_analysis);
     if (sourceAnalysis) {
       this.sourceAnalysis = sourceAnalysis;
+      this.sourceWaveformPreview = sourceAnalysis.waveformPreview;
+      this.applySourceDuration(sourceAnalysis.duration);
       const audioFile = String(
         sourceAnalysis.audioFile || payload.audio_file || this.widgets.audioFile?.value || "",
       );
@@ -1282,7 +1945,7 @@ export class BeatPromptSequencer {
     }
     this.playheadFrame = clamp(relative * this.fps(), 0, this.sequenceFrameCount());
     this.updateTransportTime();
-    this.scheduleDraw();
+    this.scheduleDraw(false);
   }
 
   async loopPlayback(resume = false) {
@@ -1290,7 +1953,7 @@ export class BeatPromptSequencer {
     this.audioElement.currentTime = this.cropStartSeconds();
     this.playheadFrame = 0;
     this.updateTransportTime();
-    this.scheduleDraw();
+    this.scheduleDraw(false);
     if (!resume || !this.audioElement.paused) return;
     try {
       await this.audioElement.play();
@@ -1344,7 +2007,7 @@ export class BeatPromptSequencer {
     this.playheadFrame = 0;
     this.updatePlayButton();
     if (this.transportTimeEl) this.updateTransportTime();
-    this.scheduleDraw();
+    this.scheduleDraw(false);
   }
 
   async startSeparation() {
@@ -1428,6 +2091,321 @@ export class BeatPromptSequencer {
     this.setStatus(payload.message || "Stem separation complete", "fresh");
     if (this.widgets.analysisSource) this.widgets.analysisSource.value = "drums";
     this.requestAnalysis(true);
+  }
+
+  setAudioJobControls(transcribing) {
+    this.root.querySelector('[data-action="analyze"]').disabled = transcribing;
+    this.root.querySelector('[data-action="separate"]').disabled = transcribing;
+  }
+
+  async refreshTranscriptionModelStatus() {
+    if (!this.root || this.transcriptionJobId) return;
+    const button = this.root.querySelector('[data-action="transcribe"]');
+    try {
+      const response = await api.fetchApi(
+        `/fl/audio-prompt-timeline/transcription-model/status?model=${encodeURIComponent(this.lyricsSettings.model)}`,
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Could not read transcription model status.");
+      button.textContent = payload.ready ? "Transcribe lyrics" : "Download model & transcribe";
+      button.title = payload.ready
+        ? `${payload.name} is installed. Transcription and audio remain local.`
+        : `${payload.name} will download only when you click this button.`;
+    } catch (error) {
+      button.textContent = "Transcribe lyrics";
+      button.title = error.message;
+    }
+  }
+
+  async startTranscription() {
+    if (this.transcriptionJobId) {
+      const response = await api.fetchApi(
+        `/fl/audio-prompt-timeline/transcribe/${encodeURIComponent(this.transcriptionJobId)}/cancel`,
+        { method: "POST" },
+      );
+      const payload = await response.json();
+      if (!response.ok) this.showError(payload.error || "Could not cancel lyrics transcription.");
+      else this.setStatus(payload.message || "Cancelling lyrics transcription…");
+      return;
+    }
+    const audioFile = String(this.widgets.audioFile?.value || "");
+    if (!audioFile) {
+      this.showError("Choose an audio file before transcribing lyrics.");
+      return;
+    }
+    if (this.lyricsCurrent() && this.lyricsTimeline?.segments.length &&
+        !globalThis.confirm("Replace the current timed lyrics? Existing corrections will be lost.")) {
+      return;
+    }
+    this.activateLane("lyrics");
+    this.setStatus("Starting local lyrics transcription…");
+    this.setAudioJobControls(true);
+    try {
+      const response = await api.fetchApi("/fl/audio-prompt-timeline/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audio_file: audioFile,
+          source: this.lyricsSettings.source,
+          model: this.lyricsSettings.model,
+          language: this.lyricsSettings.language,
+          allow_download: true,
+        }),
+      });
+      const payload = await response.json();
+      if (payload.status === "completed") {
+        this.finishTranscription(payload);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(payload.error || `Lyrics transcription failed (${response.status}).`);
+      }
+      const job = payload;
+      this.transcriptionJobId = job.job_id;
+      this.node._flAudioTranscriptionJobId = this.transcriptionJobId;
+      this.root.querySelector('[data-action="transcribe"]').textContent = "Cancel transcription";
+      this.setStatus(job.message || "Lyrics transcription running…", "loading");
+      this.pollTranscription();
+    } catch (error) {
+      this.setAudioJobControls(false);
+      this.showError(error.message);
+      this.refreshTranscriptionModelStatus();
+    }
+  }
+
+  async pollTranscription() {
+    if (!this.transcriptionJobId) return;
+    try {
+      const response = await api.fetchApi(
+        `/fl/audio-prompt-timeline/transcribe/${encodeURIComponent(this.transcriptionJobId)}`,
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Could not read lyrics transcription status.");
+      const percent = Math.round(finiteNumber(payload.progress) * 100);
+      this.setStatus(`${payload.message || payload.status} · ${percent}%`, "loading", percent / 100);
+      if (payload.status === "completed") {
+        this.finishTranscription(payload);
+        return;
+      }
+      if (["error", "cancelled"].includes(payload.status)) {
+        this.transcriptionJobId = null;
+        this.node._flAudioTranscriptionJobId = null;
+        this.setAudioJobControls(false);
+        if (payload.status === "error") this.showError(payload.message || "Lyrics transcription failed.");
+        else this.setStatus("Lyrics transcription cancelled", "cached");
+        this.refreshTranscriptionModelStatus();
+        return;
+      }
+      this.transcriptionTimer = setTimeout(() => this.pollTranscription(), 750);
+    } catch (error) {
+      this.transcriptionJobId = null;
+      this.node._flAudioTranscriptionJobId = null;
+      this.setAudioJobControls(false);
+      this.showError(error.message);
+      this.refreshTranscriptionModelStatus();
+    }
+  }
+
+  finishTranscription(payload) {
+    clearTimeout(this.transcriptionTimer);
+    this.transcriptionJobId = null;
+    this.node._flAudioTranscriptionJobId = null;
+    this.setAudioJobControls(false);
+    const timeline = normalizeLyricsTimeline(payload.transcript);
+    if (!timeline) {
+      this.showError("The transcription service returned an invalid lyrics timeline.");
+      this.refreshTranscriptionModelStatus();
+      return;
+    }
+    this.runEdit("Replace lyrics with transcription", () => {
+      this.lyricsTimeline = timeline;
+      this.selectedLyricsSegmentId = timeline.segments[0]?.id || null;
+      this.clearError();
+      this.setStatus(
+        timeline.segments.length
+          ? `${timeline.segments.length} timed lyric line${timeline.segments.length === 1 ? "" : "s"} ready`
+          : "No sung lyrics were detected",
+        "fresh",
+      );
+      this.saveViewState();
+      this.activateLane("lyrics");
+    }, { isolated: true });
+    this.refreshTranscriptionModelStatus();
+  }
+
+  async importLyricsFile() {
+    const file = this.lyricsImportInput.files?.[0];
+    this.lyricsImportInput.value = "";
+    if (!file) return;
+    const extension = file.name.toLowerCase().split(".").pop();
+    if (!["lrc", "srt"].includes(extension)) {
+      this.showError("Import a timed .lrc or .srt file. Untimed text cannot be aligned automatically.");
+      return;
+    }
+    if (this.lyricsTimeline && !globalThis.confirm("Replace the current lyrics timeline?")) return;
+    try {
+      const text = await file.text();
+      const segments = extension === "lrc"
+        ? parseLrcLyrics(text, { duration: this.sourceDurationSeconds() })
+        : parseSrtLyrics(text);
+      if (!segments.length) throw new Error(`The ${extension.toUpperCase()} file has no timed lyric cues.`);
+      this.runEdit("Import timed lyrics", () => {
+        this.lyricsTimeline = normalizeLyricsTimeline({
+          version: 1,
+          audio_file: String(this.widgets.audioFile?.value || ""),
+          requested_language: this.lyricsSettings.language,
+          detected_language: this.lyricsSettings.language === "auto" ? "" : this.lyricsSettings.language,
+          audio_source: "manual",
+          segments,
+        });
+        this.selectedLyricsSegmentId = segments[0].id;
+        this.clearError();
+        this.saveViewState();
+        this.activateLane("lyrics");
+        this.setStatus(`Imported ${segments.length} timed lyric lines`, "fresh");
+      });
+    } catch (error) {
+      this.showError(`Lyrics import failed: ${error.message}`);
+    }
+  }
+
+  async resetLyricsFromCache() {
+    const cacheKey = this.lyricsTimeline?.cacheKey;
+    if (!cacheKey) return;
+    if (!globalThis.confirm("Replace all lyric corrections with the original transcription?")) return;
+    try {
+      const response = await api.fetchApi(
+        `/fl/audio-prompt-timeline/transcripts/${encodeURIComponent(cacheKey)}`,
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Original transcription was not found.");
+      const timeline = normalizeLyricsTimeline(payload.transcript);
+      if (!timeline) throw new Error("The cached transcription is invalid.");
+      this.runEdit("Reset lyrics from transcription", () => {
+        this.lyricsTimeline = timeline;
+        this.selectedLyricsSegmentId = timeline.segments[0]?.id || null;
+        this.clearError();
+        this.saveViewState();
+        this.syncLyricsInspector();
+        this.scheduleDraw();
+      });
+    } catch (error) {
+      this.showError(error.message);
+    }
+  }
+
+  discardLyrics() {
+    if (!this.lyricsTimeline || !globalThis.confirm("Discard the lyrics timeline from this workflow?")) return;
+    this.runEdit("Discard lyrics", () => {
+      this.lyricsTimeline = null;
+      this.selectedLyricsSegmentId = null;
+      this.saveViewState();
+      this.syncLyricsInspector();
+      this.scheduleDraw();
+    });
+  }
+
+  addLyricsSegment(startOverride = null) {
+    const audioFile = String(this.widgets.audioFile?.value || "");
+    if (!audioFile) {
+      this.showError("Choose an audio file before adding timed lyrics.");
+      return;
+    }
+    const segments = this.lyricsTimeline?.segments.map(segment => ({ ...segment })) || [];
+    const startFrame = clamp(
+      startOverride ?? this.playheadFrame ?? 0,
+      0,
+      Math.max(0, this.sequenceFrameCount() - 1),
+    );
+    const start = this.cropStartSeconds() + startFrame / this.fps();
+    if (segments.some(segment => start >= segment.start - EPSILON && start < segment.end - EPSILON)) {
+      this.showError("The playhead is already inside a lyric segment.");
+      return;
+    }
+    const next = segments.find(segment => segment.start >= start - EPSILON);
+    const previous = [...segments].reverse().find(segment => segment.end <= start + EPSILON);
+    const minimum = previous?.end || 0;
+    const maximum = next?.start || this.cropStartSeconds() + this.sequenceFrameCount() / this.fps();
+    const resolvedStart = Math.max(minimum, start);
+    const end = Math.min(maximum, resolvedStart + 2);
+    if (end <= resolvedStart + EPSILON) {
+      this.showError("There is no open time at the playhead for another lyric segment.");
+      return;
+    }
+    const id = nextLyricsSegmentId(this.lyricsTimeline);
+    segments.push({ id, start: resolvedStart, end, text: "New lyric", origin: "manual" });
+    this.persistLyrics(segments, id);
+    this.selectLyricsSegment(id);
+    this.lyricsFields.text.focus();
+    this.lyricsFields.text.select();
+  }
+
+  splitLyricsSegment() {
+    const segment = this.selectedLyricsSegment();
+    if (!segment) return;
+    const frame = this.playheadFrame;
+    if (frame == null) {
+      this.showError("Place the playhead inside the selected lyric before splitting.");
+      return;
+    }
+    const split = this.cropStartSeconds() + frame / this.fps();
+    if (split <= segment.start + 1 / this.fps() || split >= segment.end - 1 / this.fps()) {
+      this.showError("Place the playhead away from the lyric segment edges.");
+      return;
+    }
+    let caret = this.lyricsFields.text.selectionStart;
+    if (!(caret > 0 && caret < segment.text.length) && segment.words?.length) {
+      const word = segment.words.findIndex(value => value.start >= split);
+      if (word > 0) caret = segment.words.slice(0, word).reduce((total, value) => total + value.text.length + 1, 0) - 1;
+    }
+    if (!(caret > 0 && caret < segment.text.length)) {
+      const midpoint = Math.floor(segment.text.length / 2);
+      caret = segment.text.lastIndexOf(" ", midpoint);
+      if (caret <= 0) caret = segment.text.indexOf(" ", midpoint);
+    }
+    const leftText = segment.text.slice(0, caret).trim();
+    const rightText = segment.text.slice(caret).trim();
+    if (!leftText || !rightText) {
+      this.showError("Place the text caret between words before splitting this lyric.");
+      return;
+    }
+    const segments = this.lyricsTimeline.segments.map(value => ({ ...value }));
+    const index = segments.findIndex(value => value.id === segment.id);
+    const nextId = nextLyricsSegmentId({ ...this.lyricsTimeline, segments });
+    segments.splice(index, 1,
+      { ...segment, end: split, text: leftText, origin: "corrected", words: undefined },
+      { id: nextId, start: split, end: segment.end, text: rightText, origin: "corrected" },
+    );
+    this.persistLyrics(segments, nextId);
+  }
+
+  mergeLyricsSegment() {
+    const segment = this.selectedLyricsSegment();
+    if (!segment) return;
+    const segments = this.lyricsTimeline.segments.map(value => ({ ...value }));
+    const index = segments.findIndex(value => value.id === segment.id);
+    const next = segments[index + 1];
+    if (!next) {
+      this.showError("There is no following lyric segment to merge.");
+      return;
+    }
+    segments.splice(index, 2, {
+      ...segment,
+      end: next.end,
+      text: `${segment.text} ${next.text}`.replace(/\s+/g, " ").trim().slice(0, 1000),
+      origin: "corrected",
+      words: undefined,
+    });
+    this.persistLyrics(segments, segment.id);
+  }
+
+  deleteLyricsSegment() {
+    const segment = this.selectedLyricsSegment();
+    if (!segment) return;
+    const segments = this.lyricsTimeline.segments.filter(value => value.id !== segment.id);
+    const index = this.lyricsTimeline.segments.findIndex(value => value.id === segment.id);
+    const selected = segments[Math.min(index, segments.length - 1)]?.id || null;
+    this.persistLyrics(segments, selected);
   }
 
   sourceUnit() {
@@ -1606,6 +2584,7 @@ export class BeatPromptSequencer {
       this.loadTimeline();
     }
     this.resnapClipsToGrid();
+    this.resnapSongMapToGrid();
     this.saveViewState();
     this.zoomToFit();
     this.refreshBeatStatus();
@@ -1650,6 +2629,10 @@ export class BeatPromptSequencer {
     const offsetText = offset ? ` · offset ${offset > 0 ? "+" : ""}${offset} ms` : "";
     const beatSource = this.beatData.beatAnalysisSource || "mix";
     const referenceSource = this.beatData.analysisSource || "mix";
+    const songMap = this.songMap();
+    const songMapText = songMap
+      ? ` · ${songMap.sections.length} song sections · ${songMap.moments.length} moments`
+      : "";
     const sourceText = this.beatData.detector?.name === "beat_this"
       ? ` · Beat This: ${beatSource}${referenceSource !== beatSource ? ` · transients: ${referenceSource}` : ""}`
       : "";
@@ -1658,6 +2641,7 @@ export class BeatPromptSequencer {
       `${detected} beats · ${downbeats} downbeats · ${onsets} onsets` +
       (averageConfidence > 0 ? ` · ${(averageConfidence * 100).toFixed(0)}% avg confidence` : "") +
       sourceText +
+      songMapText +
       offsetText;
     if (this.dataFresh) {
       this.setStatus(text, "fresh");
@@ -1685,6 +2669,7 @@ export class BeatPromptSequencer {
   }
 
   select(index) {
+    if (this.activeLane !== "prompt") this.activateLane("prompt");
     this.selectedIndex = index >= 0 && index < this.clips.length ? index : -1;
     this.selectedIndices = this.selectedIndex >= 0
       ? new Set([this.selectedIndex])
@@ -1695,6 +2680,7 @@ export class BeatPromptSequencer {
   }
 
   toggleSelection(index) {
+    if (this.activeLane !== "prompt") this.activateLane("prompt");
     if (index < 0 || index >= this.clips.length) return;
     if (this.selectedIndices.has(index)) {
       this.selectedIndices.delete(index);
@@ -1711,6 +2697,7 @@ export class BeatPromptSequencer {
   }
 
   selectRange(index) {
+    if (this.activeLane !== "prompt") this.activateLane("prompt");
     if (index < 0 || index >= this.clips.length) return;
     const anchor = this.selectionAnchor >= 0 ? this.selectionAnchor : this.selectedIndex;
     const start = Math.min(anchor >= 0 ? anchor : index, index);
@@ -1727,6 +2714,281 @@ export class BeatPromptSequencer {
     return [...this.selectedIndices].sort((left, right) => left - right);
   }
 
+  selectedSongSection() {
+    return this.songMap()?.sections.find(section => section.id === this.selectedSongSectionId) || null;
+  }
+
+  songSectionIndex(id) {
+    return this.songMap()?.sections.findIndex(section => section.id === id) ?? -1;
+  }
+
+  songSectionLocalRange(section) {
+    const cropStart = this.cropStartSeconds();
+    return {
+      start: Math.round((section.start - cropStart) * this.fps()),
+      end: Math.round((section.end - cropStart) * this.fps()),
+    };
+  }
+
+  sourceTimeAtLocalFrame(frame) {
+    return clamp(
+      this.cropStartSeconds() + frame / this.fps(),
+      0,
+      this.sourceAnalysis?.songMap?.duration ?? Infinity,
+    );
+  }
+
+  editableSongSections() {
+    return (this.songMap()?.sections || []).map(section => ({
+      id: section.id,
+      start: section.start,
+      end: section.end,
+      family: section.family,
+      role: { ...section.role },
+    }));
+  }
+
+  persistSongSections(sections, save = true) {
+    this.songMapOverrides = replaceSongMapSections(
+      this.songMapOverrides,
+      this.sourceAnalysis?.songMap,
+      sections,
+    );
+    if (save) this.saveViewState();
+    this.syncInspector();
+    this.scheduleDraw();
+  }
+
+  selectSongSection(id) {
+    const sections = this.songMap()?.sections || [];
+    this.selectedSongSectionId = sections.some(section => section.id === id) ? id : null;
+    this.selectedSongSectionIds = this.selectedSongSectionId
+      ? new Set([this.selectedSongSectionId])
+      : new Set();
+    this.songSelectionAnchorId = this.selectedSongSectionId;
+    this.activateLane("song-map");
+    this.scheduleDraw();
+  }
+
+  positionSongLabelEditor() {
+    if (!this.editingSongSectionId || this.songLabelEditor.hidden) return;
+    const rect = this.songMapRects.find(entry => entry.section.id === this.editingSongSectionId);
+    if (!rect) return;
+    const right = Math.max(TIMELINE_LEFT + 1, this.canvas.clientWidth - TIMELINE_RIGHT);
+    const width = Math.min(Math.max(44, rect.width - 8), right - TIMELINE_LEFT);
+    const left = clamp(rect.x + 4, TIMELINE_LEFT, right - width);
+    const height = clamp(rect.height - 8, 20, 28);
+    this.songLabelEditor.style.left = `${left}px`;
+    this.songLabelEditor.style.top = `${rect.y + (rect.height - height) / 2}px`;
+    this.songLabelEditor.style.width = `${width}px`;
+    this.songLabelEditor.style.height = `${height}px`;
+  }
+
+  beginSongLabelEdit(section) {
+    if (!section) return;
+    if (this.editingSongSectionId && this.editingSongSectionId !== section.id) {
+      this.finishSongLabelEdit(true);
+    }
+    this.selectSongSection(section.id);
+    this.beginEdit("Rename Song Map section");
+    const label = songSectionLabel(section);
+    this.editingSongSectionId = section.id;
+    this.songLabelEditor.value = label;
+    this.songLabelEditor.dataset.originalValue = label;
+    this.songLabelEditor.hidden = false;
+    this.positionSongLabelEditor();
+    this.songLabelEditor.focus();
+    this.songLabelEditor.select();
+  }
+
+  finishSongLabelEdit(commit) {
+    const sectionId = this.editingSongSectionId;
+    if (!sectionId) return;
+    const value = this.songLabelEditor.value.trim().slice(0, 48);
+    const originalValue = this.songLabelEditor.dataset.originalValue || "";
+    this.editingSongSectionId = null;
+    this.songLabelEditor.hidden = true;
+    delete this.songLabelEditor.dataset.originalValue;
+    if (!commit || value === originalValue) {
+      this.cancelEdit();
+      this.scheduleDraw();
+      return;
+    }
+    const section = this.songMap()?.sections.find(entry => entry.id === sectionId);
+    if (!section) {
+      this.cancelEdit();
+      return;
+    }
+    const defaultLabel = songSectionLabel({
+      ...section,
+      role: { ...section.role, customLabel: "" },
+    });
+    const customLabel = value === defaultLabel ? "" : value;
+    if (customLabel === (section.role.customLabel || "")) {
+      this.cancelEdit();
+      return;
+    }
+    if (!this.historyTransaction) this.beginEdit("Rename Song Map section");
+    this.setSongMapRole(
+      section,
+      !customLabel && section.role.value === "unknown" ? "auto" : section.role.value,
+      customLabel,
+    );
+    this.commitEdit();
+  }
+
+  toggleSongSelection(id) {
+    if (this.songSectionIndex(id) < 0) return;
+    if (this.selectedSongSectionIds.has(id)) {
+      this.selectedSongSectionIds.delete(id);
+      if (this.selectedSongSectionId === id) {
+        this.selectedSongSectionId = [...this.selectedSongSectionIds].at(-1) || null;
+      }
+    } else {
+      this.selectedSongSectionIds.add(id);
+      this.selectedSongSectionId = id;
+    }
+    this.songSelectionAnchorId = id;
+    this.activateLane("song-map");
+    this.scheduleDraw();
+  }
+
+  selectSongRange(id) {
+    const sections = this.songMap()?.sections || [];
+    const index = sections.findIndex(section => section.id === id);
+    const anchor = sections.findIndex(section => section.id === this.songSelectionAnchorId);
+    if (index < 0) return;
+    const start = Math.min(anchor >= 0 ? anchor : index, index);
+    const end = Math.max(anchor >= 0 ? anchor : index, index);
+    this.selectedSongSectionIds = new Set(sections.slice(start, end + 1).map(section => section.id));
+    this.selectedSongSectionId = id;
+    this.activateLane("song-map");
+    this.scheduleDraw();
+  }
+
+  createWriterDocument(scope) {
+    const bpm = finiteNumber(this.beatData?.gridBpm, this.beatData?.bpm);
+    const music = createSongWriterContext(this.songMap(), this.clips, {
+      fps: this.fps(),
+      cropStart: this.cropStartSeconds(),
+      totalFrames: this.sequenceFrameCount(),
+      bpm,
+    });
+    const lyrics = this.lyricsWriterContext();
+    return createPromptWriterDocument(this.clips, {
+      scope,
+      selectedIndices: this.selectedClipIndices(),
+      selectedIndex: this.selectedIndex,
+      fps: this.fps(),
+      totalFrames: this.sequenceFrameCount(),
+      bpm,
+      beatLabel: (frame) => this.nearestBeatLabel(frame),
+      songContext: music.songContext,
+      musicContext: (index) => music.boxContexts.get(index) || null,
+      musicContextRevision: this.songMapRevision(),
+      lyricsContext: lyrics.lyricsContext,
+      lyricContext: (index) => lyrics.boxContexts.get(index) || null,
+      lyricsContextRevision: lyrics.revision,
+    });
+  }
+
+  setWriterActivity(activity) {
+    this.writerCompletionFades ||= new Map();
+    clearTimeout(this.writerActivityTimer);
+    this.writerActivityTimer = null;
+    const phase = String(activity?.phase || "idle");
+    if (phase === "idle") {
+      this.clearWriterActivity();
+      return;
+    }
+    const indices = (value) => new Set((Array.isArray(value) ? value : [])
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < this.clips.length));
+    if (!activity?.restoring && !this.writerReducedMotion) {
+      const expires = performance.now() + 700;
+      for (const index of indices(activity?.newlyCompletedIndices)) this.writerCompletionFades.set(index, expires);
+    }
+    this.writerActivity = {
+      phase,
+      label: String(activity?.label || "Beat Writer"),
+      scopeIndices: indices(activity?.scopeIndices),
+      targetIndices: indices(activity?.targetIndices),
+      appliedIndices: indices(activity?.appliedIndices),
+      completedIndices: indices(activity?.completedIndices),
+      activeIndex: Number.isInteger(activity?.activeIndex) ? activity.activeIndex : null,
+      failedIndex: Number.isInteger(activity?.failedIndex) ? activity.failedIndex : null,
+      progressCompleted: Number(activity?.progressCompleted) || 0,
+      progressTotal: Number(activity?.progressTotal) || 0,
+    };
+    this.writerActivityStartedAt = performance.now();
+    if (["applied", "complete", "no_changes", "stopped"].includes(phase)) {
+      this.writerActivityTimer = setTimeout(() => this.clearWriterActivity(), phase === "applied" ? 5000 : 3500);
+    }
+    this.scheduleDraw(false);
+    this.scheduleWriterActivityFrame();
+  }
+
+  clearWriterActivity() {
+    this.writerCompletionFades ||= new Map();
+    clearTimeout(this.writerActivityTimer);
+    this.writerActivityTimer = null;
+    this.writerActivity = null;
+    this.writerCompletionFades.clear();
+    if (this.writerActivityFrame !== null) cancelAnimationFrame(this.writerActivityFrame);
+    this.writerActivityFrame = null;
+    this.scheduleDraw(false);
+  }
+
+  scheduleWriterActivityFrame() {
+    this.writerCompletionFades ||= new Map();
+    const now = performance.now();
+    for (const [index, expires] of this.writerCompletionFades) {
+      if (expires <= now) this.writerCompletionFades.delete(index);
+    }
+    const animated = !this.writerReducedMotion && (
+      (this.writerActivity?.activeIndex != null && ["editing", "writing"].includes(this.writerActivity.phase)) ||
+      this.writerCompletionFades.size
+    );
+    if (!animated || this.writerActivityFrame !== null) return;
+    this.writerActivityFrame = requestAnimationFrame(() => {
+      this.writerActivityFrame = null;
+      this.scheduleDraw(false);
+      this.scheduleWriterActivityFrame();
+    });
+  }
+
+  applyWriterUpdates(document, updates) {
+    return this.runEdit("Apply Beat Writer edit", () => {
+      if (document.music_context_revision !== this.songMapRevision()) {
+        throw new Error("The song map changed while Beat Writer was working. Send the request again.");
+      }
+      if (document.lyrics_context_revision !== this.lyricsWriterContext().revision) {
+        throw new Error("The timed lyrics changed while Beat Writer was working. Send the request again.");
+      }
+      const result = applyPromptWriterUpdates(
+        this.clips,
+        document.revision,
+        updates,
+        document.allowed_indices,
+      );
+      if (!result.applied) return 0;
+      this.serialize();
+      this.syncInspector();
+      this.scheduleDraw();
+      if (this.historyTransaction) this.historyTransaction.count = result.applied;
+      return result.applied;
+    }, { kind: "writer", isolated: true });
+  }
+
+  undoWriterUpdates() {
+    const entry = this.undoStack.at(-1);
+    if (entry?.kind !== "writer") {
+      throw new Error("The latest edit is not a Beat Writer edit. Use the sequencer Undo control instead.");
+    }
+    const count = entry.count;
+    this.undo();
+    return count;
+  }
+
   nearestBeatLabel(frame) {
     const frames = this.beatFrames();
     if (!frames.length) return "unavailable";
@@ -1738,6 +3000,8 @@ export class BeatPromptSequencer {
   }
 
   syncInspector() {
+    this.syncSongInspector();
+    this.syncLyricsInspector();
     const clip = this.selectedClip();
     this.clipInspector.classList.toggle("disabled", this.migrationPending || !clip);
     if (!clip) {
@@ -1758,6 +3022,120 @@ export class BeatPromptSequencer {
     this.promptMetaEl.textContent =
       `frames ${clip.start}–${clip.end} · ${formatClock(clip.start / this.fps())}–${formatClock(clip.end / this.fps())} · ` +
       `beats ${this.nearestBeatLabel(clip.start)}–${this.nearestBeatLabel(clip.end)}`;
+  }
+
+  syncSongInspector() {
+    const section = this.selectedSongSection();
+    this.songInspector.classList.toggle("disabled", !this.songMap());
+    if (!section) {
+      for (const field of Object.values(this.songFields)) field.value = "";
+      this.songMetaEl.textContent = "";
+      this.songSummaryEl.textContent = "";
+      return;
+    }
+    const range = this.songSectionLocalRange(section);
+    const frames = range.end - range.start;
+    this.songFields.start.value = String(range.start);
+    this.songFields.end.value = String(range.end);
+    this.songFields.start.disabled = range.start < 0;
+    this.songFields.end.disabled = range.end > this.sequenceFrameCount();
+    this.songFields.duration.value = `${frames} frames / ${(frames / this.fps()).toFixed(3)}s`;
+    this.songFields.role.value = section.role.value;
+    this.songMetaEl.textContent =
+      `source ${formatClock(section.start)}–${formatClock(section.end)} · ` +
+      `${this.nearestBeatLabel(range.start)}–${this.nearestBeatLabel(range.end)}`;
+    this.songSummaryEl.textContent =
+      `Energy ${section.energy.mean.toFixed(2)} mean / ${section.energy.peak.toFixed(2)} peak / ${section.energy.trend}. ` +
+      `Rhythm ${section.rhythm.onsetDensity.toFixed(2)} onsets/sec. ` +
+      `Bars ${section.barStart + 1}–${Math.max(section.barStart + 1, section.barEnd)}. ` +
+      `${section.role.source === "manual" ? "Manual label." : `${Math.round(section.role.confidence * 100)}% inferred label.`}`;
+  }
+
+  syncLyricsInspector() {
+    const segment = this.selectedLyricsSegment();
+    const current = this.lyricsCurrent();
+    this.lyricsFields.source.value = this.lyricsSettings.source;
+    this.lyricsFields.model.value = this.lyricsSettings.model;
+    this.lyricsFields.language.value = this.lyricsSettings.language;
+    this.lyricsFields.includeInWriter.checked = this.lyricsSettings.includeInWriter;
+    this.lyricsInspector.classList.remove("disabled");
+    this.lyricsFields.start.disabled = !segment;
+    this.lyricsFields.end.disabled = !segment;
+    this.lyricsFields.text.disabled = !segment;
+    this.root.querySelector('[data-action="reset-lyrics"]').disabled = !this.lyricsTimeline?.cacheKey;
+    this.root.querySelector('[data-action="discard-lyrics"]').disabled = !this.lyricsTimeline;
+    if (!segment) {
+      this.lyricsFields.start.value = "";
+      this.lyricsFields.end.value = "";
+      this.lyricsFields.duration.value = "";
+      this.lyricsFields.text.value = "";
+      this.lyricsMetaEl.textContent = "";
+    } else {
+      const range = this.lyricsSegmentLocalRange(segment);
+      const frames = range.end - range.start;
+      this.lyricsFields.start.value = String(range.start);
+      this.lyricsFields.end.value = String(range.end);
+      this.lyricsFields.start.disabled = range.start < 0;
+      this.lyricsFields.end.disabled = range.end > this.sequenceFrameCount();
+      this.lyricsFields.duration.value = `${frames} frames / ${(frames / this.fps()).toFixed(3)}s`;
+      this.lyricsFields.text.value = segment.text;
+      this.lyricsMetaEl.textContent =
+        `${segment.origin} · source ${formatClock(segment.start)}–${formatClock(segment.end)}`;
+    }
+    if (!this.lyricsTimeline) {
+      this.lyricsStatusEl.textContent = "No timed lyrics yet. Transcribe locally or import an LRC/SRT file.";
+      this.lyricsStatusEl.className = "flbps-lyrics-status";
+    } else if (!current) {
+      this.lyricsStatusEl.textContent =
+        `Lyrics belong to ${this.lyricsTimeline.audioFile || "another audio file"} and are excluded from Beat Writer.`;
+      this.lyricsStatusEl.className = "flbps-lyrics-status warning";
+    } else {
+      const language = this.lyricsTimeline.detectedLanguage || this.lyricsTimeline.requestedLanguage || "unknown";
+      const writer = this.lyricsSettings.includeInWriter ? "included in Beat Writer" : "excluded from Beat Writer";
+      this.lyricsStatusEl.textContent =
+        `${this.lyricsTimeline.segments.length} timed line${this.lyricsTimeline.segments.length === 1 ? "" : "s"} · ` +
+        `${language} · ${this.lyricsTimeline.audioSource} · ${writer}. Only text is sent; audio stays local.`;
+      this.lyricsStatusEl.className = "flbps-lyrics-status ready";
+    }
+  }
+
+  applyLyricsInspector() {
+    const segment = this.selectedLyricsSegment();
+    if (!segment) return;
+    const segments = this.lyricsTimeline.segments.map(value => ({ ...value }));
+    const index = segments.findIndex(value => value.id === segment.id);
+    const previous = segments[index - 1];
+    const next = segments[index + 1];
+    const startFrame = Math.round(finiteNumber(this.lyricsFields.start.value));
+    const endFrame = Math.round(finiteNumber(this.lyricsFields.end.value));
+    const start = this.cropStartSeconds() + startFrame / this.fps();
+    const end = this.cropStartSeconds() + endFrame / this.fps();
+    if (start < (previous?.end || 0) - EPSILON || end > (next?.start || Infinity) + EPSILON || end <= start) {
+      this.showError("Lyric timing must remain ordered without overlaps.");
+      this.syncLyricsInspector();
+      return;
+    }
+    segments[index] = { ...segments[index], start, end, origin: "corrected" };
+    delete segments[index].words;
+    this.clearError();
+    this.persistLyrics(segments, segment.id);
+  }
+
+  applyLyricsText() {
+    const segment = this.selectedLyricsSegment();
+    if (!segment) return;
+    const text = this.lyricsFields.text.value.replace(/\s+/g, " ").trim();
+    if (!text) {
+      this.showError("A lyric segment cannot be empty. Delete it instead.");
+      this.syncLyricsInspector();
+      return;
+    }
+    const segments = this.lyricsTimeline.segments.map(value => ({ ...value }));
+    const index = segments.findIndex(value => value.id === segment.id);
+    segments[index] = { ...segments[index], text: text.slice(0, 1000), origin: "corrected" };
+    delete segments[index].words;
+    this.clearError();
+    this.persistLyrics(segments, segment.id);
   }
 
   setInspectorTab(tab) {
@@ -1824,15 +3202,27 @@ export class BeatPromptSequencer {
       card.querySelector('[data-envelope-field="prompt"]').value = layer.prompt;
       for (const input of card.querySelectorAll("[data-envelope-field]")) {
         const eventName = input.dataset.envelopeField === "prompt" ? "input" : "change";
-        input.addEventListener(eventName, () => this.updateEnvelopeField(index, input));
+        if (input.dataset.envelopeField === "prompt") {
+          input.addEventListener("focus", () => this.beginEdit(`Edit envelope ${index + 1} prompt`));
+          input.addEventListener("blur", () => this.commitEdit());
+          input.addEventListener(eventName, () => {
+            if (!this.historyTransaction) this.beginEdit(`Edit envelope ${index + 1} prompt`);
+            this.updateEnvelopeField(index, input);
+          });
+        } else {
+          input.addEventListener(eventName, () => this.runEdit(
+            `Edit envelope ${index + 1}`,
+            () => this.updateEnvelopeField(index, input),
+          ));
+        }
       }
       card.querySelector('[data-action="duplicate-envelope"]').addEventListener(
         "click",
-        () => this.duplicateEnvelope(index),
+        () => this.runEdit(`Duplicate envelope ${index + 1}`, () => this.duplicateEnvelope(index)),
       );
       card.querySelector('[data-action="clear-envelope"]').addEventListener(
         "click",
-        () => this.clearEnvelope(index),
+        () => this.runEdit(`Clear envelope ${index + 1}`, () => this.clearEnvelope(index)),
       );
       card.querySelector("canvas").addEventListener("click", (event) => {
         const bounds = event.currentTarget.getBoundingClientRect();
@@ -1846,7 +3236,10 @@ export class BeatPromptSequencer {
       });
     });
     for (const button of this.envelopeCards.querySelectorAll('[data-action="add-envelope-slot"]')) {
-      button.addEventListener("click", () => this.addEnvelope(Number(button.dataset.slot)));
+      button.addEventListener("click", () => this.runEdit(
+        `Add envelope ${Number(button.dataset.slot) + 1}`,
+        () => this.addEnvelope(Number(button.dataset.slot)),
+      ));
     }
     this.addEnvelopeButton.disabled = !hasEmptySlot;
     this.envelopeViewKey = "";
@@ -2071,13 +3464,376 @@ export class BeatPromptSequencer {
     this.scheduleDraw();
   }
 
+  songSectionEntries() {
+    return this.editableSongSections().map(section => ({
+      section,
+      ...this.songSectionLocalRange(section),
+    }));
+  }
+
+  songRangeAvailable(start, end, ignoreId = null) {
+    return end > start && start >= 0 && end <= this.sequenceFrameCount() &&
+      this.songSectionEntries().every(entry => (
+        entry.section.id === ignoreId || end <= entry.start || start >= entry.end
+      ));
+  }
+
+  applySongInspector() {
+    const section = this.selectedSongSection();
+    if (!section) return;
+    const sections = this.editableSongSections();
+    const index = sections.findIndex(entry => entry.id === section.id);
+    const originalRange = this.songSectionLocalRange(section);
+    const start = Math.round(finiteNumber(this.songFields.start.value));
+    const end = Math.round(finiteNumber(this.songFields.end.value));
+    const previous = sections[index - 1];
+    const next = sections[index + 1];
+    const previousEnd = previous ? this.songSectionLocalRange(previous).end : -Infinity;
+    const nextStart = next ? this.songSectionLocalRange(next).start : Infinity;
+    const invalidCropStart = start < 0 && start !== originalRange.start;
+    const invalidCropEnd = end > this.sequenceFrameCount() && end !== originalRange.end;
+    if (!(end > start) || start < previousEnd || end > nextStart || invalidCropStart || invalidCropEnd) {
+      this.showError("Song Map sections need valid, non-overlapping frame ranges.");
+      this.syncSongInspector();
+      return;
+    }
+    const roleValue = this.songFields.role.value;
+    const customLabel = section.role.customLabel || "";
+    const roleChanged = roleValue !== section.role.value;
+    sections[index] = {
+      ...sections[index],
+      start: this.sourceTimeAtLocalFrame(start),
+      end: this.sourceTimeAtLocalFrame(end),
+      role: roleChanged ? {
+        value: roleValue,
+        customLabel,
+        source: "manual",
+        confidence: 1,
+      } : { ...section.role },
+    };
+    if (roleChanged) {
+      this.songMapOverrides = updateSongMapOverride(
+        this.songMapOverrides,
+        this.sourceAnalysis?.songMap,
+        section.id,
+        roleValue,
+        customLabel,
+      );
+    }
+    this.clearError();
+    this.persistSongSections(sections);
+  }
+
+  resetSongLabels() {
+    const base = this.sourceAnalysis?.songMap;
+    if (!base) return;
+    const baseRoles = new Map(base.sections.map(section => [section.id, section.role]));
+    if (this.songMapOverrides.sections) {
+      const sections = this.editableSongSections().map(section => ({
+        ...section,
+        role: { ...(baseRoles.get(section.id) || {
+          value: "unknown",
+          customLabel: "",
+          source: "manual",
+          confidence: 1,
+        }) },
+      }));
+      this.songMapOverrides = replaceSongMapSections(
+        { ...this.songMapOverrides, roles: {} },
+        base,
+        sections,
+      );
+    } else {
+      this.songMapOverrides = { ...this.songMapOverrides, roles: {} };
+    }
+    this.saveViewState();
+    this.syncInspector();
+    this.scheduleDraw();
+  }
+
+  resetSongStructure() {
+    const base = this.sourceAnalysis?.songMap;
+    if (!base) return;
+    this.songMapOverrides = resetSongMapStructure(this.songMapOverrides, base);
+    if (!base.sections.some(section => section.id === this.selectedSongSectionId)) {
+      this.selectedSongSectionId = base.sections[0]?.id || null;
+      this.selectedSongSectionIds = this.selectedSongSectionId
+        ? new Set([this.selectedSongSectionId])
+        : new Set();
+    }
+    this.saveViewState();
+    this.syncInspector();
+    this.scheduleDraw();
+  }
+
+  resetEntireSongMap() {
+    const base = this.sourceAnalysis?.songMap;
+    if (!base) return;
+    this.songMapOverrides = normalizeSongMapOverrides({
+      version: 2,
+      cacheKey: base.cacheKey,
+      roles: {},
+      sections: null,
+      nextId: 1,
+    });
+    this.selectedSongSectionId = base.sections[0]?.id || null;
+    this.selectedSongSectionIds = this.selectedSongSectionId
+      ? new Set([this.selectedSongSectionId])
+      : new Set();
+    this.saveViewState();
+    this.syncInspector();
+    this.scheduleDraw();
+  }
+
+  addSongSection(startOverride = null, endOverride = null) {
+    const base = this.sourceAnalysis?.songMap;
+    if (!base) return;
+    const frame = startOverride ?? this.playheadFrame ?? 0;
+    const exact = endOverride != null;
+    const range = exact ? { start: startOverride, end: endOverride } : this.gridClipRangeAt(frame);
+    if (range === null) {
+      this.showError("There is not enough room for a four-grid Song Map section.");
+      return;
+    }
+    let start = Math.round(range?.start ?? this.snapFrame(frame));
+    let end = Math.round(range?.end ?? Math.min(start + this.defaultClipLength(), this.sequenceFrameCount()));
+    if (!this.songRangeAvailable(start, end)) {
+      this.showError("Add sections in an empty Song Map range, or split the section under the playhead.");
+      return;
+    }
+    const id = nextSongMapSectionId(this.songMapOverrides, base);
+    const sections = this.editableSongSections();
+    sections.push({
+      id,
+      start: this.sourceTimeAtLocalFrame(start),
+      end: this.sourceTimeAtLocalFrame(end),
+      family: `M${id.split("-").at(-1)}`,
+      role: { value: "unknown", customLabel: "", source: "manual", confidence: 1 },
+    });
+    sections.sort((left, right) => left.start - right.start);
+    this.selectedSongSectionId = id;
+    this.selectedSongSectionIds = new Set([id]);
+    this.songSelectionAnchorId = id;
+    this.clearError();
+    this.persistSongSections(sections);
+  }
+
+  splitSongSection() {
+    const section = this.selectedSongSection();
+    const base = this.sourceAnalysis?.songMap;
+    if (!section || !base) return;
+    const range = this.songSectionLocalRange(section);
+    let split = this.playheadFrame == null ? Math.round((range.start + range.end) / 2) : this.playheadFrame;
+    split = this.snapFrame(split, range.start + 1, range.end - 1);
+    if (split <= range.start || split >= range.end) {
+      this.showError("Place the playhead inside the selected Song Map section before splitting.");
+      return;
+    }
+    const sections = this.editableSongSections();
+    const index = sections.findIndex(entry => entry.id === section.id);
+    const id = nextSongMapSectionId(this.songMapOverrides, base);
+    const boundary = this.sourceTimeAtLocalFrame(split);
+    sections.splice(index, 1,
+      { ...sections[index], end: boundary },
+      { ...sections[index], id, start: boundary },
+    );
+    this.selectedSongSectionId = id;
+    this.selectedSongSectionIds = new Set([id]);
+    this.songSelectionAnchorId = id;
+    this.clearError();
+    this.persistSongSections(sections);
+  }
+
+  deleteSongSection() {
+    const section = this.selectedSongSection();
+    if (!section) return;
+    const sections = this.editableSongSections();
+    const index = sections.findIndex(entry => entry.id === section.id);
+    sections.splice(index, 1);
+    const next = sections[Math.min(index, sections.length - 1)];
+    this.selectedSongSectionId = next?.id || null;
+    this.selectedSongSectionIds = this.selectedSongSectionId
+      ? new Set([this.selectedSongSectionId])
+      : new Set();
+    this.clearError();
+    this.persistSongSections(sections);
+  }
+
+  duplicateSongSection() {
+    const section = this.selectedSongSection();
+    if (!section) return;
+    const range = this.songSectionLocalRange(section);
+    const duration = range.end - range.start;
+    let start = range.end;
+    let end = start + duration;
+    const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
+    if (markers.length) {
+      const sectionStartIndex = this.nearestBeatIndex(range.start, markers);
+      const sectionEndIndex = this.nearestBeatIndex(range.end, markers);
+      const gridSpan = sectionStartIndex >= 0 && sectionEndIndex > sectionStartIndex
+        ? sectionEndIndex - sectionStartIndex
+        : DEFAULT_CLIP_GRID_INTERVALS;
+      const startIndex = markers.findIndex(marker => marker >= range.end);
+      if (startIndex < 0 || startIndex + gridSpan >= markers.length) {
+        this.showError("There is not enough empty space after this Song Map section to duplicate it.");
+        return;
+      }
+      start = markers[startIndex];
+      end = markers[startIndex + gridSpan];
+    }
+    if (!this.songRangeAvailable(start, end)) {
+      this.showError("There is not enough empty space after this Song Map section to duplicate it.");
+      return;
+    }
+    const id = nextSongMapSectionId(this.songMapOverrides, this.sourceAnalysis?.songMap);
+    const sections = this.editableSongSections();
+    sections.push({
+      ...section,
+      id,
+      start: this.sourceTimeAtLocalFrame(start),
+      end: this.sourceTimeAtLocalFrame(end),
+      role: { ...section.role, source: "manual", confidence: 1 },
+    });
+    sections.sort((left, right) => left.start - right.start);
+    this.selectedSongSectionId = id;
+    this.selectedSongSectionIds = new Set([id]);
+    this.songSelectionAnchorId = id;
+    this.clearError();
+    this.persistSongSections(sections);
+  }
+
+  copySongSection() {
+    const section = this.selectedSongSection();
+    if (!section) return;
+    const range = this.songSectionLocalRange(section);
+    const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
+    const startIndex = this.nearestBeatIndex(range.start, markers);
+    const endIndex = this.nearestBeatIndex(range.end, markers);
+    this.clipboardSongSection = {
+      section: { ...section, role: { ...section.role } },
+      duration: range.end - range.start,
+      gridSpan: startIndex >= 0 && endIndex > startIndex
+        ? endIndex - startIndex
+        : DEFAULT_CLIP_GRID_INTERVALS,
+    };
+    this.clearError();
+  }
+
+  pasteSongSection() {
+    if (!this.clipboardSongSection) {
+      this.showError("Copy a Song Map section before pasting.");
+      return;
+    }
+    let start = this.snapFrame(this.playheadFrame ?? 0, 0, this.sequenceFrameCount());
+    const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
+    let end = start + this.clipboardSongSection.duration;
+    if (markers.length) {
+      const startIndex = this.nearestBeatIndex(start, markers);
+      start = markers[startIndex];
+      end = markers[Math.min(markers.length - 1, startIndex + this.clipboardSongSection.gridSpan)];
+    }
+    if (!this.songRangeAvailable(start, end)) {
+      this.showError("Place the playhead in an empty Song Map range before pasting.");
+      return;
+    }
+    const id = nextSongMapSectionId(this.songMapOverrides, this.sourceAnalysis?.songMap);
+    const source = this.clipboardSongSection.section;
+    const sections = this.editableSongSections();
+    sections.push({
+      id,
+      start: this.sourceTimeAtLocalFrame(start),
+      end: this.sourceTimeAtLocalFrame(end),
+      family: source.family,
+      role: { ...source.role, source: "manual", confidence: 1 },
+    });
+    sections.sort((left, right) => left.start - right.start);
+    this.selectedSongSectionId = id;
+    this.selectedSongSectionIds = new Set([id]);
+    this.songSelectionAnchorId = id;
+    this.playheadFrame = end;
+    this.clearError();
+    this.persistSongSections(sections);
+    this.updateTransportTime();
+  }
+
+  songMapRawText() {
+    return JSON.stringify({
+      version: 1,
+      sections: this.editableSongSections().map(section => {
+        const range = this.songSectionLocalRange(section);
+        return {
+          id: section.id,
+          start_frame: range.start,
+          end_frame: range.end,
+          family: section.family,
+          role: section.role.value,
+          custom_label: section.role.customLabel || "",
+        };
+      }),
+    }, null, 2);
+  }
+
+  applySongMapRaw() {
+    try {
+      const parsed = JSON.parse(this.rawText.value);
+      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.sections)) {
+        throw new Error("Raw Song Map data needs version 1 and a sections array.");
+      }
+      const sections = parsed.sections.map((section, index) => {
+        const startFrame = Number(section.start_frame);
+        const endFrame = Number(section.end_frame);
+        if (!Number.isInteger(startFrame) || !Number.isInteger(endFrame)) {
+          throw new Error(`Song Map section ${index + 1} needs integer start_frame and end_frame values.`);
+        }
+        return {
+          id: String(section.id || `manual-${index + 1}`).trim().slice(0, 80),
+          start: this.sourceTimeAtLocalFrame(startFrame),
+          end: this.sourceTimeAtLocalFrame(endFrame),
+          family: String(section.family || `M${index + 1}`).trim().slice(0, 16),
+          role: {
+            value: section.role,
+            customLabel: String(section.custom_label || "").trim().slice(0, 48),
+            source: "manual",
+            confidence: 1,
+          },
+        };
+      });
+      validateSongMapSections(sections, this.sourceAnalysis?.songMap?.duration);
+      this.selectedSongSectionId = sections[0]?.id || null;
+      this.selectedSongSectionIds = this.selectedSongSectionId
+        ? new Set([this.selectedSongSectionId])
+        : new Set();
+      this.songMapOverrides = { ...this.songMapOverrides, roles: {} };
+      this.clearError();
+      this.persistSongSections(sections);
+      this.toggleRaw(false);
+    } catch (error) {
+      this.showError(error.message);
+    }
+  }
+
   toggleRaw(force) {
     const open = typeof force === "boolean" ? force : !this.rawPanel.classList.contains("open");
-    if (open) this.rawText.value = this.widgets.timeline?.value || "";
+    if (open) {
+      this.rawLane = this.activeLane;
+      if (this.rawLane === "song-map") {
+        this.rawLabel.textContent = "Advanced Song Map structure in local integer frames. Sections need unique IDs and cannot overlap.";
+        this.rawText.value = this.songMapRawText();
+        this.root.querySelector('[data-action="raw-apply"]').textContent = "Apply sections";
+      } else {
+        this.rawLabel.textContent = "Advanced frame schedule. All positions, fades, and crossfades must be integer frames.";
+        this.rawText.value = this.widgets.timeline?.value || "";
+        this.root.querySelector('[data-action="raw-apply"]').textContent = "Apply frames";
+      }
+    }
     this.rawPanel.classList.toggle("open", open);
   }
 
   applyRaw() {
+    if (this.rawLane === "song-map") {
+      this.applySongMapRaw();
+      return;
+    }
     try {
       const clearedRenderGroups = this.clips.some((clip) => clip.renderGroup != null);
       const clips = validateFrameClips(parseTimeline(
@@ -2356,6 +4112,43 @@ export class BeatPromptSequencer {
     return true;
   }
 
+  resnapSongMapToGrid(markers = null) {
+    if (this.drag || !this.songMapOverrides.sections?.length) return false;
+    const entries = this.songSectionEntries();
+    const maximum = this.sequenceFrameCount();
+    if (!entries.length || entries.some(entry => entry.start < 0 || entry.end > maximum)) return false;
+    const snapMarkers = markers || this.editingSnapFrames(0, maximum);
+    if (!snapMarkers.length) return false;
+
+    const values = [];
+    const startBoundaries = [];
+    const endBoundaries = [];
+    for (let index = 0; index < entries.length; index++) {
+      if (index && entries[index - 1].end === entries[index].start) {
+        startBoundaries.push(endBoundaries[index - 1]);
+      } else {
+        startBoundaries.push(values.length);
+        values.push(entries[index].start);
+      }
+      endBoundaries.push(values.length);
+      values.push(entries[index].end);
+    }
+    const targets = this.orderedSnapTargets(values, snapMarkers);
+    if (!targets) return false;
+    const sections = this.editableSongSections();
+    let changed = false;
+    for (let index = 0; index < sections.length; index++) {
+      const start = targets[startBoundaries[index]];
+      const end = targets[endBoundaries[index]];
+      changed ||= start !== entries[index].start || end !== entries[index].end;
+      sections[index].start = this.sourceTimeAtLocalFrame(start);
+      sections[index].end = this.sourceTimeAtLocalFrame(end);
+    }
+    if (!changed) return false;
+    this.persistSongSections(sections);
+    return true;
+  }
+
   defaultClipLength() {
     return Math.max(1, Math.round(this.fps() * 2));
   }
@@ -2502,23 +4295,54 @@ export class BeatPromptSequencer {
 
   onDoubleClick(event) {
     const { x, y } = this.eventPosition(event);
+    const layout = this.timelineLayout();
+    if (layout.lyricsTop != null && y >= layout.lyricsTop && y <= layout.lyricsBottom) {
+      const hit = this.lyricsHitTest(x, y);
+      this.playheadFrame = Math.round(clamp(this.frameAtX(x), 0, this.sequenceFrameCount()));
+      if (hit) {
+        this.selectLyricsSegment(hit.segment.id);
+        this.lyricsFields.text.focus();
+      } else {
+        this.runEdit("Add lyric", () => this.addLyricsSegment(this.playheadFrame));
+      }
+      this.updateTransportTime();
+      event.preventDefault();
+      return;
+    }
+    if (layout.songMapTop != null && y >= layout.songMapTop && y <= layout.songMapBottom) {
+      const labelHit = this.songMapLabelHitTest(x, y);
+      const hit = this.songMapHitTest(x, y);
+      this.playheadFrame = this.snapFrame(this.frameAtX(x), 0, this.sequenceFrameCount());
+      if (labelHit) this.beginSongLabelEdit(labelHit.section);
+      else if (hit) this.selectSongSection(hit.section.id);
+      else {
+        const range = this.gridClipRangeAt(this.playheadFrame);
+        this.runEdit("Add Song Map section", () => {
+          if (range) this.addSongSection(range.start, range.end);
+          else this.addSongSection(this.playheadFrame);
+        });
+      }
+      this.updateTransportTime();
+      event.preventDefault();
+      return;
+    }
     const transition = this.crossfadeRects.find((rect) => (
       y >= rect.y &&
       y <= rect.y + rect.height &&
       Math.abs(x - rect.boundaryX) <= 10
     ));
     if (transition) {
-      this.toggleCrossfade(transition.index);
+      this.runEdit("Toggle prompt crossfade", () => this.toggleCrossfade(transition.index));
       event.preventDefault();
       return;
     }
     const hit = this.hitTest(x, y);
     if (hit?.type.startsWith("crossfade")) {
-      this.toggleCrossfade(hit.index);
+      this.runEdit("Toggle prompt crossfade", () => this.toggleCrossfade(hit.index));
       event.preventDefault();
       return;
     }
-    this.addClipAtPointer(event);
+    this.runEdit("Add prompt", () => this.addClipAtPointer(event));
   }
 
   closeContextMenu() {
@@ -2663,6 +4487,76 @@ export class BeatPromptSequencer {
     menu.style.top = `${clamp(event.clientY, 6, window.innerHeight - rect.height - 6)}px`;
   }
 
+  setSongMapRole(section, role, customLabel = "") {
+    this.songMapOverrides = updateSongMapOverride(
+      this.songMapOverrides,
+      this.sourceAnalysis?.songMap,
+      section.id,
+      role,
+      customLabel,
+    );
+    this.saveViewState();
+    this.syncInspector();
+    this.scheduleDraw();
+  }
+
+  openSongMapContextMenu(section, event) {
+    const menu = document.createElement("div");
+    menu.className = "flbps-context-menu";
+    menu.addEventListener("contextmenu", (menuEvent) => menuEvent.preventDefault());
+    const title = document.createElement("div");
+    title.className = "flbps-context-title";
+    title.textContent = songSectionLabel(section);
+    menu.appendChild(title);
+    for (const [label, action, historyLabel] of [
+      ["Split at playhead", () => this.splitSongSection(), "Split Song Map section"],
+      ["Duplicate section", () => this.duplicateSongSection(), "Duplicate Song Map section"],
+      ["Copy section", () => this.copySongSection(), ""],
+      ["Delete section", () => this.deleteSongSection(), "Delete Song Map section"],
+    ]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", () => {
+        this.closeContextMenu();
+        if (historyLabel) this.runEdit(historyLabel, action);
+        else action();
+      });
+      menu.appendChild(button);
+    }
+    const roles = [
+      ["auto", "Auto label"],
+      ["intro", "Intro"],
+      ["verse", "Verse"],
+      ["pre_chorus", "Pre-Chorus"],
+      ["chorus", "Chorus"],
+      ["bridge", "Bridge"],
+      ["instrumental", "Instrumental"],
+      ["breakdown", "Breakdown"],
+      ["outro", "Outro"],
+    ];
+    for (const [value, label] of roles) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", () => {
+        this.closeContextMenu();
+        this.runEdit("Change Song Map label", () => this.setSongMapRole(section, value));
+      });
+      menu.appendChild(button);
+    }
+    const resetAll = document.createElement("button");
+    resetAll.type = "button";
+    resetAll.textContent = "Reset all manual labels";
+    resetAll.disabled = !Object.keys(this.songMapOverrides.roles).length && !this.songMapOverrides.sections;
+    resetAll.addEventListener("click", () => {
+      this.closeContextMenu();
+      this.runEdit("Reset Song Map labels", () => this.resetSongLabels());
+    });
+    menu.appendChild(resetAll);
+    this.openContextMenu(menu, event);
+  }
+
   onContextMenu(event) {
     event.preventDefault();
     event.stopPropagation();
@@ -2675,8 +4569,40 @@ export class BeatPromptSequencer {
     }
     this.closeContextMenu();
 
+    const songMapHit = this.songMapHitTest(x, y);
+    if (songMapHit) {
+      this.playheadFrame = this.snapFrame(this.frameAtX(x), 0, this.sequenceFrameCount());
+      if (!this.selectedSongSectionIds.has(songMapHit.section.id)) {
+        this.selectSongSection(songMapHit.section.id);
+      } else {
+        this.activateLane("song-map");
+      }
+      this.updateTransportTime();
+      this.openSongMapContextMenu(songMapHit.section, event);
+      return;
+    }
+    if (layout.songMapTop != null && y >= layout.songMapTop && y <= layout.songMapBottom) {
+      this.activateLane("song-map");
+      this.playheadFrame = this.snapFrame(this.frameAtX(x), 0, this.sequenceFrameCount());
+      this.updateTransportTime();
+      const menu = document.createElement("div");
+      menu.className = "flbps-context-menu";
+      menu.innerHTML = `<div class="flbps-context-title">Empty Song Map range</div><button data-action="add-song">Add section here</button><button data-action="paste-song">Paste section here</button>`;
+      menu.querySelector('[data-action="add-song"]').addEventListener("click", () => {
+        this.closeContextMenu();
+        this.runEdit("Add Song Map section", () => this.addSongSection());
+      });
+      menu.querySelector('[data-action="paste-song"]').addEventListener("click", () => {
+        this.closeContextMenu();
+        this.runEdit("Paste Song Map section", () => this.pasteSongSection());
+      });
+      this.openContextMenu(menu, event);
+      return;
+    }
+
     const hit = y >= layout.trackTop ? this.hitTest(x, y) : null;
     if (hit) {
+      this.activateLane("prompt");
       if (!this.selectedIndices.has(hit.index)) this.select(hit.index);
       const indices = this.selectedClipIndices();
       const group = this.clips[hit.index]?.renderGroup;
@@ -2694,7 +4620,7 @@ export class BeatPromptSequencer {
       `;
       menu.querySelector('[data-action="group-render"]').addEventListener("click", () => {
         this.closeContextMenu();
-        this.groupSelected();
+        this.runEdit("Group prompt renders", () => this.groupSelected());
       });
       menu.querySelector('[data-action="select-render"]').addEventListener("click", () => {
         this.closeContextMenu();
@@ -2702,7 +4628,7 @@ export class BeatPromptSequencer {
       });
       menu.querySelector('[data-action="ungroup-render"]').addEventListener("click", () => {
         this.closeContextMenu();
-        this.ungroupSelected();
+        this.runEdit("Ungroup prompt renders", () => this.ungroupSelected());
       });
       this.openContextMenu(menu, event);
       return;
@@ -2729,11 +4655,11 @@ export class BeatPromptSequencer {
     `;
     menu.querySelector('[data-action="set-in"]').addEventListener("click", () => {
       this.closeContextMenu();
-      this.setAudioIn(frame);
+      this.runEdit("Set audio in point", () => this.setAudioIn(frame));
     });
     menu.querySelector('[data-action="set-out"]').addEventListener("click", () => {
       this.closeContextMenu();
-      this.setAudioOut(frame);
+      this.runEdit("Set audio out point", () => this.setAudioOut(frame));
     });
     this.openContextMenu(menu, event);
   }
@@ -2924,23 +4850,51 @@ export class BeatPromptSequencer {
 
   timelineLayout(height = this.canvas.clientHeight) {
     const sourceVisible = Boolean(this.sourceWaveformPreview);
+    const songMapVisible = Boolean(this.songMap());
+    const lyricsVisible = Boolean(this.widgets?.audioFile?.value || this.lyricsTimeline);
     const sourceTop = sourceVisible ? 4 : null;
     const sourceBottom = sourceVisible ? 38 : null;
     const rulerTop = sourceVisible ? 44 : 4;
     const rulerBottom = rulerTop + 30;
-    const waveformTop = rulerBottom + 2;
-    const waveformBottom = waveformTop + 92;
+    const songMapTop = songMapVisible ? rulerBottom + 2 : null;
+    const songMapBottom = songMapVisible ? songMapTop + 34 : null;
+    const afterSongMap = songMapVisible ? songMapBottom + 3 : rulerBottom + 2;
+    const lyricsTop = lyricsVisible ? afterSongMap : null;
+    const lyricsHeight = this.lyricsTimeline?.segments.length && this.lyricsSettings?.laneExpanded !== false ? 52 : 27;
+    const lyricsBottom = lyricsVisible ? lyricsTop + lyricsHeight : null;
+    const waveformTop = lyricsVisible ? lyricsBottom + 3 : afterSongMap;
+    const waveformBottom = waveformTop + 80;
     const trackTop = waveformBottom + 7;
     return {
       sourceTop,
       sourceBottom,
       rulerTop,
       rulerBottom,
+      songMapTop,
+      songMapBottom,
+      lyricsTop,
+      lyricsBottom,
       waveformTop,
       waveformBottom,
       trackTop,
       trackBottom: height - 8,
     };
+  }
+
+  lyricsHitTest(x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    for (let index = this.lyricsRects.length - 1; index >= 0; index--) {
+      const rect = this.lyricsRects[index];
+      if (y < rect.y || y > rect.y + rect.height) continue;
+      if (Number.isFinite(rect.startX) && Math.abs(x - rect.startX) <= 8) {
+        return { ...rect, type: "start" };
+      }
+      if (Number.isFinite(rect.endX) && Math.abs(x - rect.endX) <= 8) {
+        return { ...rect, type: "end" };
+      }
+      if (x >= rect.x && x <= rect.x + rect.width) return { ...rect, type: "move" };
+    }
+    return null;
   }
 
   sourceFrameAtX(x) {
@@ -3023,6 +4977,7 @@ export class BeatPromptSequencer {
     if (event.button !== 0) return;
     const trimHit = this.hitTestTrim(x, y);
     if (trimHit) {
+      this.beginEdit("Trim audio range");
       this.drag = {
         type: trimHit.type,
         pointerStartX: x,
@@ -3040,8 +4995,88 @@ export class BeatPromptSequencer {
       return;
     }
     if (this.migrationPending || this.rawInvalid) return;
+    const layout = this.timelineLayout();
+    const lyricsHit = this.lyricsHitTest(x, y);
+    if (lyricsHit) {
+      this.selectLyricsSegment(lyricsHit.segment.id);
+      if (lyricsHit.type === "move" && !lyricsHit.movable) {
+        event.preventDefault();
+        return;
+      }
+      this.beginEdit(lyricsHit.type === "move" ? "Move lyric" : "Resize lyric");
+      this.drag = {
+        type: `lyrics-${lyricsHit.type}`,
+        pointerStartRaw: Math.round(this.frameAtX(x)),
+        pointerStartX: x,
+        pointerStartY: y,
+        originalSegments: this.lyricsTimeline.segments.map(segment => ({ ...segment })),
+        originalIndex: lyricsHit.index,
+        active: false,
+      };
+      this.canvas.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      return;
+    }
+    if (layout.lyricsTop != null && y >= layout.lyricsTop && y <= layout.lyricsBottom) {
+      this.activateLane("lyrics");
+      this.playheadFrame = Math.round(clamp(this.frameAtX(x), 0, this.sequenceFrameCount()));
+      this.updateTransportTime();
+      this.scheduleDraw();
+      event.preventDefault();
+      return;
+    }
+    const songHit = this.songMapHitTest(x, y);
+    if (songHit) {
+      if (event.shiftKey) {
+        this.selectSongRange(songHit.section.id);
+        event.preventDefault();
+        return;
+      }
+      if (event.ctrlKey || event.metaKey) {
+        this.toggleSongSelection(songHit.section.id);
+        event.preventDefault();
+        return;
+      }
+      this.selectSongSection(songHit.section.id);
+      if (songHit.type === "move" && !songHit.movable) {
+        event.preventDefault();
+        return;
+      }
+      this.beginEdit(songHit.type === "move" ? "Move Song Map section" : "Resize Song Map section");
+      const sections = this.editableSongSections();
+      const index = sections.findIndex(section => section.id === songHit.section.id);
+      const range = this.songSectionLocalRange(sections[index]);
+      const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
+      const startIndex = this.nearestBeatIndex(range.start, markers);
+      const endIndex = this.nearestBeatIndex(range.end, markers);
+      this.drag = {
+        type: `song-${songHit.type}`,
+        pointerStartRaw: Math.round(this.frameAtX(x)),
+        pointerStartX: x,
+        pointerStartY: y,
+        pointerX: x,
+        pointerY: y,
+        originalSections: sections,
+        originalIndex: index,
+        originalEdgeFrame: songHit.edgeFrame,
+        gridSpan: startIndex >= 0 && endIndex > startIndex ? endIndex - startIndex : null,
+        active: false,
+      };
+      this.canvas.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      return;
+    }
+    if (layout.songMapTop != null && y >= layout.songMapTop && y <= layout.songMapBottom) {
+      this.activateLane("song-map");
+      this.playheadFrame = this.snapFrame(this.frameAtX(x), 0, this.sequenceFrameCount());
+      this.updateTransportTime();
+      this.scheduleDraw();
+      event.preventDefault();
+      return;
+    }
     const hit = this.hitTest(x, y);
     if (!hit) {
+      if (y >= layout.trackTop && y <= layout.trackBottom) this.activateLane("prompt");
       this.playheadFrame = this.snapFrame(this.frameAtX(x), 0, this.sequenceFrameCount());
       if (this.audioElement) {
         this.audioElement.currentTime = this.cropStartSeconds() + this.playheadFrame / this.fps();
@@ -3062,6 +5097,7 @@ export class BeatPromptSequencer {
       return;
     }
     this.select(hit.index);
+    this.beginEdit(hit.type === "move" ? "Move prompt" : "Edit prompt timing");
     const clip = this.selectedClip();
     const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
     const startIndex = this.nearestBeatIndex(clip.start, markers);
@@ -3241,6 +5277,144 @@ export class BeatPromptSequencer {
     this.scheduleDraw();
   }
 
+  updateSongDrag(x) {
+    if (!this.drag?.type.startsWith("song-")) return;
+    this.panDuringDrag(x);
+    const sections = this.drag.originalSections.map(section => ({
+      ...section,
+      role: { ...section.role },
+    }));
+    const index = this.drag.originalIndex;
+    const section = sections[index];
+    const previous = sections[index - 1];
+    const next = sections[index + 1];
+    if (!section) return;
+    const original = this.songSectionLocalRange(section);
+    const previousRange = previous ? this.songSectionLocalRange(previous) : null;
+    const nextRange = next ? this.songSectionLocalRange(next) : null;
+    const delta = Math.round(this.frameAtX(x)) - this.drag.pointerStartRaw;
+    const type = this.drag.type.slice(5);
+    const originalEdge = Number.isFinite(this.drag.originalEdgeFrame)
+      ? this.drag.originalEdgeFrame
+      : type === "start" ? original.start : original.end;
+    let guideFrame = null;
+
+    if (type === "shared-boundary") {
+      const boundary = this.snapFrame(
+        original.start + delta,
+        previousRange.start + 1,
+        original.end - 1,
+      );
+      previous.end = this.sourceTimeAtLocalFrame(boundary);
+      section.start = this.sourceTimeAtLocalFrame(boundary);
+      guideFrame = boundary;
+    } else if (type === "start") {
+      const start = this.snapFrame(
+        originalEdge + delta,
+        Math.max(0, previousRange?.end ?? 0),
+        original.end - 1,
+      );
+      section.start = this.sourceTimeAtLocalFrame(start);
+      guideFrame = start;
+    } else if (type === "end") {
+      const end = this.snapFrame(
+        originalEdge + delta,
+        original.start + 1,
+        Math.min(nextRange?.start ?? this.sequenceFrameCount(), this.sequenceFrameCount()),
+      );
+      section.end = this.sourceTimeAtLocalFrame(end);
+      guideFrame = end;
+    } else if (type === "move") {
+      const duration = original.end - original.start;
+      const previousTouches = previousRange?.end === original.start;
+      const nextTouches = nextRange?.start === original.end;
+      const minimum = previousTouches
+        ? previousRange.start + 1
+        : previousRange?.end ?? 0;
+      const maximumEnd = nextTouches
+        ? nextRange.end - 1
+        : nextRange?.start ?? this.sequenceFrameCount();
+      let start;
+      let end;
+      const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
+      if (this.drag.gridSpan && markers.length > this.drag.gridSpan) {
+        const proposed = original.start + delta;
+        let nearest = null;
+        for (let marker = 0; marker + this.drag.gridSpan < markers.length; marker++) {
+          const candidateStart = markers[marker];
+          const candidateEnd = markers[marker + this.drag.gridSpan];
+          if (candidateStart < minimum || candidateEnd > maximumEnd) continue;
+          const distance = Math.abs(candidateStart - proposed);
+          if (!nearest || distance < nearest.distance) {
+            nearest = { start: candidateStart, end: candidateEnd, distance };
+          }
+        }
+        if (!nearest) return;
+        ({ start, end } = nearest);
+      } else {
+        const maximum = maximumEnd - duration;
+        start = this.snapFrame(original.start + delta, minimum, Math.max(minimum, maximum));
+        end = start + duration;
+      }
+      section.start = this.sourceTimeAtLocalFrame(start);
+      section.end = this.sourceTimeAtLocalFrame(end);
+      if (previousTouches) previous.end = section.start;
+      if (nextTouches) next.start = section.end;
+      guideFrame = start;
+    }
+
+    this.songMapOverrides = replaceSongMapSections(
+      this.songMapOverrides,
+      this.sourceAnalysis?.songMap,
+      sections,
+    );
+    this.snapGuideFrame = guideFrame;
+    this.syncSongInspector();
+    this.scheduleDraw();
+  }
+
+  updateLyricsDrag(x) {
+    if (!this.drag?.type.startsWith("lyrics-")) return;
+    this.panDuringDrag(x);
+    const segments = this.drag.originalSegments.map(segment => ({ ...segment }));
+    const index = this.drag.originalIndex;
+    const segment = segments[index];
+    if (!segment) return;
+    const previous = segments[index - 1];
+    const next = segments[index + 1];
+    const original = this.lyricsSegmentLocalRange(segment);
+    const previousEnd = previous ? this.lyricsSegmentLocalRange(previous).end : 0;
+    const nextStart = next ? this.lyricsSegmentLocalRange(next).start : this.sequenceFrameCount();
+    const delta = Math.round(this.frameAtX(x)) - this.drag.pointerStartRaw;
+    const type = this.drag.type.slice(7);
+    let start = original.start;
+    let end = original.end;
+    if (type === "start") {
+      start = clamp(original.start + delta, Math.max(0, previousEnd), original.end - 1);
+    } else if (type === "end") {
+      end = clamp(original.end + delta, original.start + 1, Math.min(nextStart, this.sequenceFrameCount()));
+    } else if (type === "move") {
+      const duration = original.end - original.start;
+      start = clamp(
+        original.start + delta,
+        Math.max(0, previousEnd),
+        Math.max(Math.max(0, previousEnd), Math.min(nextStart, this.sequenceFrameCount()) - duration),
+      );
+      end = start + duration;
+    }
+    segment.start = this.cropStartSeconds() + start / this.fps();
+    segment.end = this.cropStartSeconds() + end / this.fps();
+    segment.origin = "corrected";
+    delete segment.words;
+    this.lyricsTimeline = normalizeLyricsTimeline({
+      ...lyricsTimelineForStorage(this.lyricsTimeline),
+      segments,
+    });
+    this.snapGuideFrame = type === "end" ? end : start;
+    this.syncLyricsInspector();
+    this.scheduleDraw();
+  }
+
   onPointerMove(event) {
     const { x, y } = this.eventPosition(event);
     if (this.drag?.type === "timeline-pan") {
@@ -3269,15 +5443,50 @@ export class BeatPromptSequencer {
       event.preventDefault();
       return;
     }
+    if (this.drag?.type.startsWith("song-")) {
+      this.drag.pointerX = x;
+      this.drag.pointerY = y;
+      if (!this.drag.active) {
+        const distance = Math.hypot(x - this.drag.pointerStartX, y - this.drag.pointerStartY);
+        if (distance < 3) return;
+        this.drag.active = true;
+      }
+      const type = this.drag.type.slice(5);
+      this.canvas.style.cursor = type === "move" ? "grabbing" : type === "shared-boundary" ? "col-resize" : "ew-resize";
+      this.updateSongDrag(x);
+      event.preventDefault();
+      return;
+    }
+    if (this.drag?.type.startsWith("lyrics-")) {
+      if (!this.drag.active) {
+        const distance = Math.hypot(x - this.drag.pointerStartX, y - this.drag.pointerStartY);
+        if (distance < 3) return;
+        this.drag.active = true;
+      }
+      this.canvas.style.cursor = this.drag.type === "lyrics-move" ? "grabbing" : "ew-resize";
+      this.updateLyricsDrag(x);
+      event.preventDefault();
+      return;
+    }
     if (!this.drag || !this.selectedClip()) {
       const trimHit = this.hitTestTrim(x, y);
       const hit = this.hitTest(x, y);
+      const songMapHit = this.songMapHitTest(x, y);
+      const lyricsHit = this.lyricsHitTest(x, y);
       this.canvas.style.cursor = trimHit
         ? trimHit.type === "trim-move" ? "grab" : "ew-resize"
         : hit
         ? hit.type === "move"
           ? "grab"
           : hit.type === "shared-boundary"
+          ? "col-resize"
+          : "ew-resize"
+        : lyricsHit
+        ? lyricsHit.type === "move" ? lyricsHit.movable ? "grab" : "pointer" : "ew-resize"
+        : songMapHit
+        ? songMapHit.type === "move"
+          ? songMapHit.movable ? "grab" : "pointer"
+          : songMapHit.type === "shared-boundary"
           ? "col-resize"
           : "ew-resize"
         : "default";
@@ -3303,6 +5512,8 @@ export class BeatPromptSequencer {
 
   onPointerUp(event) {
     if (!this.drag) return;
+    const songChanged = this.drag.type.startsWith("song-");
+    const lyricsChanged = this.drag.type.startsWith("lyrics-");
     const trimChanged = this.drag.type === "trim-start" ||
       this.drag.type === "trim-end" ||
       this.drag.type === "trim-move";
@@ -3313,11 +5524,19 @@ export class BeatPromptSequencer {
     this.canvas.style.cursor = "default";
     if (this.canvas.hasPointerCapture(event.pointerId)) this.canvas.releasePointerCapture(event.pointerId);
     if (changed) {
-      if (trimChanged) {
+      if (songChanged) {
+        this.clearError();
+        this.saveViewState();
+        this.syncInspector();
+      } else if (lyricsChanged) {
+        this.clearError();
+        this.saveViewState();
+        this.syncInspector();
+      } else if (trimChanged) {
         this.resnapClipsToGrid();
         this.zoomToFit(false);
       } else if (viewChanged) {
-        this.saveViewState();
+        this.saveViewState(false);
       } else {
         normalizeCrossfades(this.clips);
         this.serialize();
@@ -3326,6 +5545,7 @@ export class BeatPromptSequencer {
       }
     }
     if (this.resnapPending) this.resnapClipsToGrid();
+    this.commitEdit();
     this.scheduleDraw();
   }
 
@@ -3348,7 +5568,7 @@ export class BeatPromptSequencer {
       this.viewEnd = Math.min(duration, this.viewStart + nextRange);
       this.viewStart = Math.max(0, this.viewEnd - nextRange);
     }
-    this.saveViewState();
+    this.saveViewState(false);
     this.scheduleDraw();
   }
 
@@ -3360,21 +5580,131 @@ export class BeatPromptSequencer {
     const nextRange = clamp(total * factor, minimum, duration);
     this.viewStart = clamp(center - nextRange / 2, 0, Math.max(0, duration - nextRange));
     this.viewEnd = Math.min(duration, this.viewStart + nextRange);
-    this.saveViewState();
+    this.saveViewState(false);
     this.scheduleDraw();
+  }
+
+  nudgeSongSection(direction, gridSteps = 1) {
+    const section = this.selectedSongSection();
+    if (!section) return;
+    const sections = this.editableSongSections();
+    const index = sections.findIndex(entry => entry.id === section.id);
+    const previous = sections[index - 1];
+    const next = sections[index + 1];
+    const range = this.songSectionLocalRange(sections[index]);
+    const previousRange = previous ? this.songSectionLocalRange(previous) : null;
+    const nextRange = next ? this.songSectionLocalRange(next) : null;
+    const markers = this.editingSnapFrames(0, this.sequenceFrameCount());
+    const markerIndex = this.nearestBeatIndex(range.start, markers);
+    const endIndex = this.nearestBeatIndex(range.end, markers);
+    const gridSpan = endIndex > markerIndex ? endIndex - markerIndex : null;
+    const targetIndex = markerIndex + direction * gridSteps;
+    if (markerIndex < 0 || targetIndex < 0 || targetIndex >= markers.length ||
+        (gridSpan && targetIndex + gridSpan >= markers.length)) return;
+    const duration = range.end - range.start;
+    const previousTouches = previousRange?.end === range.start;
+    const nextTouches = nextRange?.start === range.end;
+    const minimum = previousTouches ? previousRange.start + 1 : previousRange?.end ?? 0;
+    const maximumEnd = nextTouches ? nextRange.end - 1 : nextRange?.start ?? this.sequenceFrameCount();
+    const proposedStart = markers[targetIndex];
+    const proposedEnd = gridSpan ? markers[targetIndex + gridSpan] : proposedStart + duration;
+    if (proposedStart < minimum || proposedEnd > maximumEnd) return;
+    const start = proposedStart;
+    const end = proposedEnd;
+    sections[index].start = this.sourceTimeAtLocalFrame(start);
+    sections[index].end = this.sourceTimeAtLocalFrame(end);
+    if (previousTouches) previous.end = sections[index].start;
+    if (nextTouches) next.start = sections[index].end;
+    this.clearError();
+    this.persistSongSections(sections);
+  }
+
+  nudgeLyricsSegment(direction, frames = 1) {
+    const segment = this.selectedLyricsSegment();
+    if (!segment) return;
+    const segments = this.lyricsTimeline.segments.map(value => ({ ...value }));
+    const index = segments.findIndex(value => value.id === segment.id);
+    const range = this.lyricsSegmentLocalRange(segment);
+    const duration = range.end - range.start;
+    const minimum = index ? this.lyricsSegmentLocalRange(segments[index - 1]).end : 0;
+    const maximumEnd = index + 1 < segments.length
+      ? this.lyricsSegmentLocalRange(segments[index + 1]).start
+      : this.sequenceFrameCount();
+    const start = clamp(range.start + direction * frames, minimum, maximumEnd - duration);
+    segments[index].start = this.cropStartSeconds() + start / this.fps();
+    segments[index].end = this.cropStartSeconds() + (start + duration) / this.fps();
+    segments[index].origin = "corrected";
+    delete segments[index].words;
+    this.persistLyrics(segments, segment.id);
   }
 
   onKeyDown(event) {
     if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) {
       return;
     }
+    if (this.activeLane === "lyrics") {
+      if ((event.key === "Delete" || event.key === "Backspace") && this.selectedLyricsSegment()) {
+        this.runEdit("Delete lyric", () => this.deleteLyricsSegment());
+        event.preventDefault();
+        return;
+      }
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && this.selectedLyricsSegment()) {
+        this.runEdit(
+          "Nudge lyric",
+          () => this.nudgeLyricsSegment(event.key === "ArrowLeft" ? -1 : 1, event.shiftKey ? 10 : 1),
+          { mergeKey: "nudge-lyric" },
+        );
+        event.preventDefault();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
+        this.runEdit("Merge lyrics", () => this.mergeLyricsSegment());
+        event.preventDefault();
+        return;
+      }
+      return;
+    }
+    if (this.activeLane === "song-map") {
+      if ((event.key === "Delete" || event.key === "Backspace") && this.selectedSongSection()) {
+        this.runEdit("Delete Song Map section", () => this.deleteSongSection());
+        event.preventDefault();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
+        this.runEdit("Duplicate Song Map section", () => this.duplicateSongSection());
+        event.preventDefault();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+        this.copySongSection();
+        event.preventDefault();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") {
+        this.runEdit("Paste Song Map section", () => this.pasteSongSection());
+        event.preventDefault();
+        return;
+      }
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && this.selectedSongSection()) {
+        this.runEdit(
+          "Nudge Song Map section",
+          () => this.nudgeSongSection(
+            event.key === "ArrowLeft" ? -1 : 1,
+            event.shiftKey ? DEFAULT_CLIP_GRID_INTERVALS : 1,
+          ),
+          { mergeKey: "nudge-song-map" },
+        );
+        event.preventDefault();
+        return;
+      }
+    }
     if ((event.key === "Delete" || event.key === "Backspace") && this.selectedClip()) {
-      this.deleteClip();
+      this.runEdit("Delete prompt", () => this.deleteClip());
       event.preventDefault();
       return;
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "d") {
-      this.duplicateClip();
+      this.runEdit("Duplicate prompt", () => this.duplicateClip());
       event.preventDefault();
       return;
     }
@@ -3384,7 +5714,7 @@ export class BeatPromptSequencer {
       return;
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") {
-      this.pasteClip();
+      this.runEdit("Paste prompt", () => this.pasteClip());
       event.preventDefault();
       return;
     }
@@ -3407,11 +5737,13 @@ export class BeatPromptSequencer {
           (!previous || markers[targetStart] >= previous.end) &&
           (!next || markers[targetEnd] <= next.start) &&
           (!Number.isFinite(maximum) || markers[targetEnd] <= maximum)) {
-        clip.start = markers[targetStart];
-        clip.end = markers[targetEnd];
-        this.serialize();
-        this.syncInspector();
-        this.scheduleDraw();
+        this.runEdit("Nudge prompt", () => {
+          clip.start = markers[targetStart];
+          clip.end = markers[targetEnd];
+          this.serialize();
+          this.syncInspector();
+          this.scheduleDraw();
+        }, { mergeKey: "nudge-prompt" });
       }
       event.preventDefault();
     }
@@ -3457,7 +5789,7 @@ export class BeatPromptSequencer {
   zoomToFit(save = true) {
     this.viewStart = 0;
     this.viewEnd = this.sequenceFrameCount();
-    if (save) this.saveViewState();
+    if (save) this.saveViewState(false);
     this.scheduleDraw();
   }
 
@@ -3468,12 +5800,14 @@ export class BeatPromptSequencer {
       (right - TIMELINE_LEFT);
   }
 
-  scheduleDraw() {
+  scheduleDraw(staticChanged = true) {
+    if (staticChanged) this.staticDirty = true;
     if (this.pendingFrame) return;
     this.pendingFrame = requestAnimationFrame(() => {
       this.pendingFrame = null;
+      const syncEnvelopePreviews = this.staticDirty;
       this.draw();
-      this.syncEnvelopePreviews();
+      if (syncEnvelopePreviews) this.syncEnvelopePreviews();
     });
   }
 
@@ -3531,6 +5865,317 @@ export class BeatPromptSequencer {
     }
   }
 
+  drawSongMapLane(ctx, width, top, bottom) {
+    const right = width - TIMELINE_RIGHT;
+    const songMap = this.songMap();
+    const previousHover = this.songMapHitTest(this.hover?.x, this.hover?.y);
+    const draggedSharedPreviousId = this.drag?.type === "song-shared-boundary"
+      ? this.drag.originalSections?.[this.drag.originalIndex - 1]?.id
+      : null;
+    this.songMapRects = [];
+    this.songMapBoundaryRects = [];
+    ctx.fillStyle = "#12161c";
+    ctx.fillRect(TIMELINE_LEFT, top, right - TIMELINE_LEFT, bottom - top);
+    ctx.strokeStyle = "#303640";
+    ctx.strokeRect(TIMELINE_LEFT + 0.5, top + 0.5, right - TIMELINE_LEFT - 1, bottom - top - 1);
+    if (!songMap) return;
+
+    const cropStart = this.cropStartSeconds();
+    for (let index = 0; index < songMap.sections.length; index++) {
+      const section = songMap.sections[index];
+      const startFrame = (section.start - cropStart) * this.fps();
+      const endFrame = (section.end - cropStart) * this.fps();
+      if (endFrame <= this.viewStart || startFrame >= this.viewEnd) continue;
+      const startEdgeFrame = Math.max(0, startFrame);
+      const endEdgeFrame = Math.min(this.sequenceFrameCount(), endFrame);
+      const x = clamp(this.frameToX(Math.max(startFrame, this.viewStart), width), TIMELINE_LEFT, right);
+      const endX = clamp(this.frameToX(Math.min(endFrame, this.viewEnd), width), TIMELINE_LEFT, right);
+      const sectionWidth = Math.max(1, endX - x);
+      const color = songSectionColor(section);
+      const selected = this.selectedSongSectionIds.has(section.id);
+      const hovered = previousHover?.section.id === section.id;
+      const shared = (this.drag?.type === "song-shared-boundary" && (
+        this.selectedSongSectionId === section.id || draggedSharedPreviousId === section.id
+      )) ||
+        (previousHover?.type === "shared-boundary" && (
+          previousHover.section.id === section.id || previousHover.previousId === section.id
+        ));
+      ctx.save();
+      if (selected || shared) {
+        ctx.shadowColor = shared ? "rgba(34,211,238,.45)" : "rgba(167,139,250,.38)";
+        ctx.shadowBlur = 7;
+      }
+      ctx.fillStyle = color;
+      ctx.globalAlpha = selected ? 0.55 : hovered ? 0.44 : 0.34;
+      ctx.fillRect(x, top + 1, sectionWidth, bottom - top - 2);
+      ctx.globalAlpha = 0.92;
+      ctx.strokeStyle = shared ? "#67e8f9" : selected ? "#ddd6fe" : color;
+      ctx.lineWidth = selected || shared ? 2 : 1;
+      ctx.strokeRect(x + 0.5, top + 1.5, Math.max(0, sectionWidth - 1), bottom - top - 3);
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, top + 1);
+      ctx.lineTo(x + 0.5, bottom - 1);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+
+      if (selected || hovered) {
+        ctx.fillStyle = shared ? "#67e8f9" : selected ? "#ddd6fe" : "rgba(255,255,255,.6)";
+        if (startEdgeFrame >= this.viewStart) {
+          ctx.fillRect(x, top + 7, Math.min(3, sectionWidth), Math.max(8, bottom - top - 14));
+        }
+        if (endEdgeFrame <= this.viewEnd) {
+          ctx.fillRect(Math.max(x, endX - 3), top + 7, Math.min(3, sectionWidth), Math.max(8, bottom - top - 14));
+        }
+      }
+
+      let labelRect = null;
+      if (sectionWidth > 22) {
+        const label = songSectionLabel(section);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x + 4, top + 1, Math.max(0, sectionWidth - 8), bottom - top - 2);
+        ctx.clip();
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = "600 8px Inter, sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, x + 6, (top + bottom) / 2);
+        labelRect = {
+          x: x + 6,
+          y: (top + bottom) / 2 - 6,
+          width: Math.min(ctx.measureText(label).width, Math.max(0, sectionWidth - 12)),
+          height: 12,
+        };
+        ctx.restore();
+      }
+      this.songMapRects.push({
+        index,
+        section,
+        x,
+        y: top,
+        width: sectionWidth,
+        height: bottom - top,
+        startX: startEdgeFrame >= this.viewStart ? x : null,
+        endX: endEdgeFrame <= this.viewEnd ? endX : null,
+        startEdgeFrame,
+        endEdgeFrame,
+        labelRect,
+        movable: startFrame >= 0 && endFrame <= this.sequenceFrameCount(),
+      });
+    }
+
+    for (let index = 1; index < songMap.sections.length; index++) {
+      const section = songMap.sections[index];
+      const previous = songMap.sections[index - 1];
+      if (Math.abs(previous.end - section.start) > 0.5 / this.fps()) continue;
+      const boundaryFrame = (section.start - cropStart) * this.fps();
+      if (boundaryFrame < this.viewStart || boundaryFrame > this.viewEnd) continue;
+      const boundaryX = this.frameToX(boundaryFrame, width);
+      this.songMapBoundaryRects.push({
+        index,
+        section,
+        previousId: previous.id,
+        boundaryX,
+        y: top,
+        height: bottom - top,
+      });
+      const highlighted = (this.drag?.type === "song-shared-boundary" && this.selectedSongSectionId === section.id) ||
+        (previousHover?.type === "shared-boundary" && previousHover.section.id === section.id);
+      if (highlighted) {
+        ctx.strokeStyle = "#67e8f9";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(boundaryX + 0.5, top + 1);
+        ctx.lineTo(boundaryX + 0.5, bottom - 1);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      }
+    }
+
+    for (const cue of songMap.cues) {
+      const startFrame = (cue.start - cropStart) * this.fps();
+      const endFrame = (cue.end - cropStart) * this.fps();
+      const anchorFrame = (cue.anchor - cropStart) * this.fps();
+      if (Math.max(endFrame, anchorFrame) < this.viewStart ||
+          Math.min(startFrame, anchorFrame) > this.viewEnd) continue;
+      const startX = clamp(this.frameToX(startFrame, width), TIMELINE_LEFT, right);
+      const endX = clamp(this.frameToX(endFrame, width), TIMELINE_LEFT, right);
+      const anchorX = clamp(this.frameToX(anchorFrame, width), TIMELINE_LEFT, right);
+      if (cue.type === "peak") {
+        ctx.strokeStyle = "rgba(254,240,138,.9)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(startX, top + 2);
+        ctx.lineTo(Math.max(startX + 1, endX), top + 2);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      } else if (cue.type === "turnaround") {
+        ctx.strokeStyle = songCueColor(cue);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(anchorX + 0.5, top + 12);
+        ctx.lineTo(anchorX + 0.5, bottom - 1);
+        ctx.stroke();
+        ctx.fillStyle = songCueColor(cue);
+        ctx.font = "700 7px Inter, sans-serif";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "bottom";
+        ctx.fillText("TURN", anchorX - 3, bottom - 3);
+        ctx.lineWidth = 1;
+      }
+    }
+
+  }
+
+  songMapHitTest(x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    for (let index = this.songMapBoundaryRects.length - 1; index >= 0; index--) {
+      const boundary = this.songMapBoundaryRects[index];
+      if (y >= boundary.y && y <= boundary.y + boundary.height &&
+          Math.abs(x - boundary.boundaryX) <= 10) {
+        return { ...boundary, type: "shared-boundary" };
+      }
+    }
+    for (let index = this.songMapRects.length - 1; index >= 0; index--) {
+      const rect = this.songMapRects[index];
+      if (y < rect.y || y > rect.y + rect.height) continue;
+      if (Number.isFinite(rect.startX) && Math.abs(x - rect.startX) <= 14) {
+        return { ...rect, type: "start", edgeFrame: rect.startEdgeFrame };
+      }
+      if (Number.isFinite(rect.endX) && Math.abs(x - rect.endX) <= 14) {
+        return { ...rect, type: "end", edgeFrame: rect.endEdgeFrame };
+      }
+      if (x >= rect.x && x <= rect.x + rect.width) return { ...rect, type: "move" };
+    }
+    return null;
+  }
+
+  songMapLabelHitTest(x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    for (let index = this.songMapRects.length - 1; index >= 0; index--) {
+      const rect = this.songMapRects[index];
+      const label = rect.labelRect;
+      if (label && x >= label.x && x <= label.x + label.width &&
+          y >= label.y && y <= label.y + label.height) {
+        return rect;
+      }
+    }
+    return null;
+  }
+
+  drawLyricsLane(ctx, width, top, bottom) {
+    const right = width - TIMELINE_RIGHT;
+    const current = this.lyricsCurrent();
+    const hover = this.lyricsHitTest(this.hover?.x, this.hover?.y);
+    this.lyricsRects = [];
+    ctx.fillStyle = current ? "#15131d" : "#1b1715";
+    ctx.fillRect(TIMELINE_LEFT, top, right - TIMELINE_LEFT, bottom - top);
+    ctx.strokeStyle = current ? "#3a304a" : "#4a3628";
+    ctx.strokeRect(TIMELINE_LEFT + 0.5, top + 0.5, right - TIMELINE_LEFT - 1, bottom - top - 1);
+    const timeline = this.lyricsTimeline;
+    if (!timeline?.segments.length || !current) {
+      ctx.fillStyle = current ? "#9584ad" : "#c99b70";
+      ctx.font = "8px Inter, sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      const message = timeline && !current
+        ? "LYRICS · STALE FOR SELECTED AUDIO"
+        : "LYRICS · TRANSCRIBE LOCALLY OR IMPORT LRC/SRT";
+      ctx.fillText(message, TIMELINE_LEFT + 7, (top + bottom) / 2);
+      return;
+    }
+    const cropStart = this.cropStartSeconds();
+    const sequenceEnd = this.sequenceFrameCount();
+    for (let index = 0; index < timeline.segments.length; index++) {
+      const segment = timeline.segments[index];
+      const startFrame = (segment.start - cropStart) * this.fps();
+      const endFrame = (segment.end - cropStart) * this.fps();
+      if (endFrame <= this.viewStart || startFrame >= this.viewEnd) continue;
+      const visibleStart = Math.max(startFrame, this.viewStart, 0);
+      const visibleEnd = Math.min(endFrame, this.viewEnd, sequenceEnd);
+      if (!(visibleEnd > visibleStart)) continue;
+      const x = clamp(this.frameToX(visibleStart, width), TIMELINE_LEFT, right);
+      const endX = clamp(this.frameToX(visibleEnd, width), TIMELINE_LEFT, right);
+      const segmentWidth = Math.max(1, endX - x);
+      const selected = segment.id === this.selectedLyricsSegmentId;
+      const hovered = hover?.segment.id === segment.id;
+      const active = this.playheadFrame != null && this.playheadFrame >= startFrame && this.playheadFrame < endFrame;
+      const color = segment.origin === "corrected" ? "#c084fc"
+        : ["lrc", "srt", "manual"].includes(segment.origin) ? "#f0abfc"
+        : "#a78bfa";
+      ctx.save();
+      if (selected || active) {
+        ctx.shadowColor = active ? "rgba(244,114,182,.5)" : "rgba(167,139,250,.45)";
+        ctx.shadowBlur = 7;
+      }
+      ctx.fillStyle = color;
+      ctx.globalAlpha = selected ? 0.45 : active ? 0.38 : hovered ? 0.3 : 0.22;
+      ctx.fillRect(x, top + 1, segmentWidth, bottom - top - 2);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = active ? "#f9a8d4" : selected ? "#ddd6fe" : color;
+      ctx.lineWidth = selected || active ? 2 : 1;
+      ctx.strokeRect(x + 0.5, top + 1.5, Math.max(0, segmentWidth - 1), bottom - top - 3);
+      ctx.restore();
+      if (selected || hovered) {
+        ctx.fillStyle = selected ? "#ddd6fe" : "rgba(255,255,255,.55)";
+        if (startFrame >= 0) ctx.fillRect(x, top + 6, Math.min(3, segmentWidth), Math.max(8, bottom - top - 12));
+        if (endFrame <= sequenceEnd) ctx.fillRect(Math.max(x, endX - 3), top + 6, Math.min(3, segmentWidth), Math.max(8, bottom - top - 12));
+      }
+      if (segmentWidth > 22) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x + 5, top + 1, Math.max(0, segmentWidth - 10), bottom - top - 2);
+        ctx.clip();
+        ctx.fillStyle = "#f5f3ff";
+        ctx.font = active ? "600 9px Inter, sans-serif" : "8px Inter, sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        const lines = canvasTextLines(ctx, segment.text, Math.max(1, segmentWidth - 12), bottom - top > 35 ? 2 : 1);
+        const lineHeight = 11;
+        const firstY = (top + bottom) / 2 - (lines.length - 1) * lineHeight / 2;
+        lines.forEach((line, lineIndex) => ctx.fillText(line, x + 6, firstY + lineIndex * lineHeight));
+        ctx.restore();
+      }
+      this.lyricsRects.push({
+        index,
+        segment,
+        x,
+        y: top,
+        width: segmentWidth,
+        height: bottom - top,
+        startX: startFrame >= 0 ? x : null,
+        endX: endFrame <= sequenceEnd ? endX : null,
+        movable: startFrame >= 0 && endFrame <= sequenceEnd,
+      });
+    }
+  }
+
+  drawEnergyCurve(ctx, width, top, bottom) {
+    const preview = this.songMap()?.energyPreview;
+    if (!preview) return;
+    const right = width - TIMELINE_RIGHT;
+    const plotHeight = Math.max(1, bottom - top - 10);
+    ctx.strokeStyle = "rgba(251,191,36,.78)";
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    let started = false;
+    for (let x = TIMELINE_LEFT; x <= right; x++) {
+      const sourceSeconds = this.cropStartSeconds() + this.frameAtX(x) / this.fps();
+      const index = Math.floor(sourceSeconds * preview.rate);
+      if (index < 0 || index >= preview.values.length) continue;
+      const y = bottom - 5 - preview.values[index] * plotHeight;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    if (started) ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+
   drawWaveformLane(ctx, width, top, bottom) {
     const right = width - TIMELINE_RIGHT;
     const center = (top + bottom) / 2;
@@ -3542,7 +6187,11 @@ export class BeatPromptSequencer {
     ctx.strokeStyle = "#293039";
     ctx.strokeRect(TIMELINE_LEFT + 0.5, top + 0.5, right - TIMELINE_LEFT - 1, bottom - top - 1);
 
-    const selected = this.selectedClip();
+    const selected = this.activeLane === "song-map"
+      ? this.selectedSongSection() && this.songSectionLocalRange(this.selectedSongSection())
+      : this.activeLane === "lyrics"
+        ? this.selectedLyricsSegment() && this.lyricsSegmentLocalRange(this.selectedLyricsSegment())
+        : this.selectedClip();
     if (selected) {
       const selectionStart = clamp(this.frameToX(selected.start, width), TIMELINE_LEFT, right);
       const selectionEnd = clamp(this.frameToX(selected.end, width), TIMELINE_LEFT, right);
@@ -3604,6 +6253,7 @@ export class BeatPromptSequencer {
     }
     ctx.stroke();
     ctx.globalAlpha = 1;
+    this.drawEnergyCurve(ctx, width, top, bottom);
 
     if (!this.hover || this.hover.y < top || this.hover.y > bottom ||
         this.hover.x < TIMELINE_LEFT || this.hover.x > right) {
@@ -4082,6 +6732,91 @@ export class BeatPromptSequencer {
     }
   }
 
+  drawWriterActivity(ctx) {
+    this.writerCompletionFades ||= new Map();
+    const activity = this.writerActivity;
+    if (!activity) return;
+    const now = performance.now();
+    for (const [index, expires] of this.writerCompletionFades) {
+      if (expires <= now) this.writerCompletionFades.delete(index);
+    }
+    const activeIndex = activity.activeIndex;
+    const queued = new Set((activity.phase === "editing" && activity.progressTotal ? [...activity.targetIndices] : []).filter((index) => (
+      index !== activeIndex && !activity.completedIndices.has(index)
+    )));
+    const visible = this.clipRects.filter((rect) => (
+      queued.has(rect.index) || rect.index === activeIndex || rect.index === activity.failedIndex || this.writerCompletionFades.has(rect.index)
+    ));
+    if (!visible.length) return;
+    const sweep = ((performance.now() - this.writerActivityStartedAt) % 1700) / 1700;
+
+    for (const rect of visible) {
+      const isActive = rect.index === activeIndex;
+      const isFailed = rect.index === activity.failedIndex;
+      const fadeUntil = this.writerCompletionFades.get(rect.index) || 0;
+      const isCompleted = fadeUntil > now;
+      const color = isFailed
+        ? "#f59e0b"
+        : isCompleted
+        ? "#34d399"
+        : isActive
+        ? "#22d3ee"
+        : "#3f6475";
+      const drawX = rect.x + 2;
+      const drawY = rect.y + 2;
+      const drawWidth = Math.max(1, rect.width - 4);
+      const drawHeight = Math.max(1, rect.height - 4);
+      ctx.save();
+      ctx.strokeStyle = color;
+      const completionAlpha = isCompleted ? Math.min(1, (fadeUntil - now) / 350) : 1;
+      ctx.globalAlpha = (isActive || isCompleted || isFailed ? 0.95 : 0.36) * completionAlpha;
+      ctx.lineWidth = isActive || isCompleted || isFailed ? 2 : 1;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = isActive || isCompleted ? 11 : 3;
+      ctx.beginPath();
+      ctx.roundRect(drawX, drawY, drawWidth, drawHeight, 5);
+      ctx.stroke();
+      ctx.restore();
+
+      if (isActive && !this.writerReducedMotion) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(drawX, drawY, drawWidth, drawHeight, 5);
+        ctx.clip();
+        const sweepX = drawX - drawWidth * 0.35 + drawWidth * 1.7 * sweep;
+        const gradient = ctx.createLinearGradient(sweepX - 22, 0, sweepX + 22, 0);
+        gradient.addColorStop(0, "rgba(56,189,248,0)");
+        gradient.addColorStop(0.5, "rgba(34,211,238,.2)");
+        gradient.addColorStop(1, "rgba(56,189,248,0)");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(drawX, drawY, drawWidth, drawHeight);
+        ctx.restore();
+      }
+
+      let chip = "";
+      if (isFailed) chip = "RETRY";
+      else if (isCompleted) chip = "\u2713 DRAFTED";
+      else if (isActive) chip = activity.progressTotal
+        ? `WRITING ${Math.min(activity.progressTotal, activity.progressCompleted + 1)}/${activity.progressTotal}`
+        : "WRITING";
+      if (!chip || rect.width < 74) continue;
+      ctx.save();
+      ctx.font = "700 7px Inter, sans-serif";
+      const chipWidth = ctx.measureText(chip).width + 12;
+      const chipX = Math.max(drawX + 4, drawX + drawWidth - chipWidth - 5);
+      const chipY = drawY + 5;
+      ctx.fillStyle = isFailed ? "rgba(120,53,15,.94)" : isCompleted ? "rgba(6,78,59,.94)" : "rgba(8,47,73,.94)";
+      ctx.beginPath();
+      ctx.roundRect(chipX, chipY, chipWidth, 14, 7);
+      ctx.fill();
+      ctx.fillStyle = isFailed ? "#fde68a" : isCompleted ? "#a7f3d0" : "#a5f3fc";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(chip, chipX + chipWidth / 2, chipY + 7.5);
+      ctx.restore();
+    }
+  }
+
   drawGuidesAndPlayhead(ctx, width, layout) {
     if (this.snapGuideFrame != null &&
         this.snapGuideFrame >= this.viewStart &&
@@ -4117,26 +6852,16 @@ export class BeatPromptSequencer {
     }
   }
 
-  draw() {
-    const cssWidth = Math.max(1, this.canvas.clientWidth);
-    const cssHeight = Math.max(1, this.canvas.clientHeight);
-    const dpr = window.devicePixelRatio || 1;
-    if (this.canvas.width !== Math.round(cssWidth * dpr) || this.canvas.height !== Math.round(cssHeight * dpr)) {
-      this.canvas.width = Math.round(cssWidth * dpr);
-      this.canvas.height = Math.round(cssHeight * dpr);
-    }
-    const ctx = this.canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssWidth, cssHeight);
-    ctx.fillStyle = "#101013";
-    ctx.fillRect(0, 0, cssWidth, cssHeight);
-
-    const layout = this.timelineLayout(cssHeight);
+  drawStatic(ctx, cssWidth, cssHeight, layout) {
     const {
       sourceTop,
       sourceBottom,
       rulerTop,
       rulerBottom,
+      songMapTop,
+      songMapBottom,
+      lyricsTop,
+      lyricsBottom,
       waveformTop,
       waveformBottom,
       trackTop,
@@ -4146,13 +6871,20 @@ export class BeatPromptSequencer {
     if (this.sourceWaveformPreview) {
       this.drawSourceOverview(ctx, cssWidth, sourceTop, sourceBottom);
     }
+    if (songMapTop != null) {
+      this.drawSongMapLane(ctx, cssWidth, songMapTop, songMapBottom);
+    } else {
+      this.songMapRects = [];
+      this.songMapBoundaryRects = [];
+    }
+    if (lyricsTop != null) this.drawLyricsLane(ctx, cssWidth, lyricsTop, lyricsBottom);
+    else this.lyricsRects = [];
     this.drawWaveformLane(ctx, cssWidth, waveformTop, waveformBottom);
     this.drawPromptClips(ctx, cssWidth, trackTop, trackBottom);
     this.drawRuler(ctx, cssWidth, rulerTop, rulerBottom);
-    const contentTop = waveformTop;
+    const contentTop = songMapTop ?? lyricsTop ?? waveformTop;
     this.drawAnalysisMarkers(ctx, cssWidth, rulerTop, rulerBottom, contentTop);
     this.drawBeatGrid(ctx, cssWidth, rulerBottom, contentTop, trackBottom);
-    this.drawGuidesAndPlayhead(ctx, cssWidth, layout);
 
     if (this.migrationPending) {
       this.emptyEl.textContent = "Run once to convert this legacy beat schedule into frames.";
@@ -4161,15 +6893,56 @@ export class BeatPromptSequencer {
     }
   }
 
+  draw() {
+    const cssWidth = Math.max(1, this.canvas.clientWidth);
+    const cssHeight = Math.max(1, this.canvas.clientHeight);
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.round(cssWidth * dpr);
+    const height = Math.round(cssHeight * dpr);
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+      this.staticDirty = true;
+    }
+    if (this.staticCanvas.width !== width || this.staticCanvas.height !== height) {
+      this.staticCanvas.width = width;
+      this.staticCanvas.height = height;
+      this.staticDirty = true;
+    }
+
+    const layout = this.timelineLayout(cssHeight);
+    if (this.staticDirty) {
+      const staticContext = this.staticCanvas.getContext("2d");
+      staticContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+      staticContext.clearRect(0, 0, cssWidth, cssHeight);
+      staticContext.fillStyle = "#101013";
+      staticContext.fillRect(0, 0, cssWidth, cssHeight);
+      this.drawStatic(staticContext, cssWidth, cssHeight, layout);
+      this.staticDirty = false;
+    }
+
+    const ctx = this.canvas.getContext("2d");
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(this.staticCanvas, 0, 0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.drawWriterActivity(ctx);
+    this.drawGuidesAndPlayhead(ctx, cssWidth, layout);
+    this.positionSongLabelEditor();
+  }
+
   dispose() {
     this.closeContextMenu();
     document.removeEventListener("pointerdown", this.documentPointerHandler, true);
     if (this.resizeObserver) this.resizeObserver.disconnect();
     if (this.pendingFrame) cancelAnimationFrame(this.pendingFrame);
+    if (this.writerActivityFrame !== null) cancelAnimationFrame(this.writerActivityFrame);
+    clearTimeout(this.writerActivityTimer);
     this.stopPlaybackLoop();
     clearTimeout(this.analysisTimer);
     clearTimeout(this.modelStatusTimer);
     clearTimeout(this.separationTimer);
+    clearTimeout(this.transcriptionTimer);
     if (this.audioElement) this.audioElement.pause();
     this.analysisRequest++;
     for (const restore of this.callbackRestorers) restore();

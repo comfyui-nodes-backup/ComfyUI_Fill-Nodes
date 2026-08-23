@@ -9,7 +9,7 @@ import torch
 
 import folder_paths
 
-from .audio_files import audio_file_hash, load_audio_file, resolve_audio_path
+from .audio_files import audio_file_hash, load_audio_file, load_audio_file_range, resolve_audio_path
 from .audio_separation import load_cached_stem
 from .beat_this_detector import MODEL_FPS, MODEL_SHA256, analyze_beats as analyze_beat_this
 
@@ -534,8 +534,6 @@ def analyze_audio_file(
     detect_beats=True,
 ):
     path = resolve_audio_path(filename)
-    _, master_audio = load_audio_file(filename)
-    cropped_audio, crop = crop_audio(master_audio, fps, trim_start_frame, length_frames)
     cache_key = analysis_cache_key(
         path,
         analysis_source,
@@ -545,7 +543,45 @@ def analyze_audio_file(
     cache_hit = cache_path.is_file()
     if cache_hit:
         source_analysis = json.loads(cache_path.read_text(encoding="utf-8"))
+        if length_frames and "sample_rate" in source_analysis:
+            sample_rate = int(source_analysis["sample_rate"])
+            source_samples = round(float(source_analysis["source_duration"]) * sample_rate)
+            start_sample = round(trim_start_frame / fps * sample_rate)
+            sample_count = round(length_frames / fps * sample_rate)
+            if start_sample >= source_samples:
+                raise ValueError(
+                    f"Trim start frame {trim_start_frame} is outside the "
+                    f"{source_analysis['source_duration']:.3f}s audio file."
+                )
+            if start_sample + sample_count > source_samples:
+                available_frames = math.floor(
+                    (source_samples - start_sample) / sample_rate * fps
+                )
+                raise ValueError(
+                    f"Length {length_frames} frames exceeds the {available_frames} frames available "
+                    "after the trim start."
+                )
+            _, cropped_audio = load_audio_file_range(
+                filename,
+                start_sample,
+                sample_count,
+            )
+            crop = {
+                "source_duration": source_samples / sample_rate,
+                "source_start": start_sample / sample_rate,
+                "trim_start_frame": int(trim_start_frame),
+                "length_frames": int(length_frames),
+                "audio_duration": cropped_audio["waveform"].shape[-1] / sample_rate,
+                "sample_rate": sample_rate,
+            }
+        else:
+            _, master_audio = load_audio_file(filename)
+            cropped_audio, crop = crop_audio(
+                master_audio, fps, trim_start_frame, length_frames
+            )
     else:
+        _, master_audio = load_audio_file(filename)
+        cropped_audio, crop = crop_audio(master_audio, fps, trim_start_frame, length_frames)
         analysis_audio = (
             master_audio
             if analysis_source == "mix"
@@ -561,6 +597,7 @@ def analyze_audio_file(
             "analysis_source": analysis_source,
             "beat_analysis_source": "mix" if detect_beats else None,
             "cache_key": cache_key,
+            "sample_rate": int(master_audio["sample_rate"]),
             "audio_duration": crop["source_duration"],
             "source_duration": crop["source_duration"],
             "source_start": 0.0,

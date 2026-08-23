@@ -2,13 +2,14 @@
 import os
 import torch
 import numpy as np
-import json
 from matplotlib import font_manager
 from PIL import Image, ImageDraw, ImageFont
 
 from ..sup import ROOT_FONTS
 
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 def parse_fonts() -> dict:
     mgr = font_manager.FontManager()
@@ -84,9 +85,8 @@ representations of images with ASCII characters.
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {
-                    "default": "",
-                    "description": "Optional: Envelope JSON for audio-reactive blending"
+                "envelope": ("FL_AUDIO_ENVELOPE", {
+                    "description": "Optional FL audio envelope for reactive blending"
                 }),
                 "blend_intensity": ("FLOAT", {
                     "default": 1.0,
@@ -110,12 +110,12 @@ representations of images with ASCII characters.
     FUNCTION = "apply_ascii_art_effect"
     CATEGORY = "🏵️Fill Nodes/VFX"
 
-    def apply_ascii_art_effect(self, image: torch.Tensor, spacing: int, font_size: int, characters, font: str, sequence_toggle: bool, envelope_json: str = "", blend_intensity: float = 1.0, invert: bool = False, mask=None):
+    def apply_ascii_art_effect(self, image: torch.Tensor, spacing: int, font_size: int, characters, font: str, sequence_toggle: bool, envelope=None, blend_intensity: float = 1.0, invert: bool = False, mask=None):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(image, spacing, font_size, characters, font, sequence_toggle, envelope_json, blend_intensity, invert, mask)
+            return self._apply_audio_reactive(image, spacing, font_size, characters, font, sequence_toggle, envelope, blend_intensity, invert, mask)
         else:
             return self._apply_static(image, spacing, font_size, characters, font, sequence_toggle, mask)
 
@@ -167,7 +167,7 @@ representations of images with ASCII characters.
 
         return (result,)
 
-    def _apply_audio_reactive(self, image: torch.Tensor, spacing: int, font_size: int, characters, font: str, sequence_toggle: bool, envelope_json: str, blend_intensity: float, invert: bool, mask=None):
+    def _apply_audio_reactive(self, image: torch.Tensor, spacing: int, font_size: int, characters, font: str, sequence_toggle: bool, envelope, blend_intensity: float, invert: bool, mask=None):
         """Audio-reactive ASCII effect with envelope-based blending"""
         print(f"\n{'='*60}")
         print(f"[FL_Ascii Audio Reactive] DEBUG: Function called")
@@ -177,12 +177,10 @@ representations of images with ASCII characters.
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = image.shape[0]
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL_Ascii Audio Reactive] Input frames: {batch_size}")
             print(f"[FL_Ascii Audio Reactive] Envelope frames: {num_envelope_frames}")
@@ -226,7 +224,7 @@ representations of images with ASCII characters.
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate blend amount
                 if invert:

@@ -1,10 +1,11 @@
 import torch
 import numpy as np
-import json
 from PIL import Image
 from sklearn.cluster import KMeans
 
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 class FL_PixelArtShader:
     @classmethod
@@ -15,9 +16,8 @@ class FL_PixelArtShader:
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {
-                    "default": "",
-                    "description": "Optional: Envelope JSON for audio-reactive blending"
+                "envelope": ("FL_AUDIO_ENVELOPE", {
+                    "description": "Optional FL audio envelope for reactive blending"
                 }),
                 "blend_intensity": ("FLOAT", {
                     "default": 1.0,
@@ -45,12 +45,12 @@ class FL_PixelArtShader:
     CATEGORY = "🏵️Fill Nodes/VFX"
 
     def apply_pixel_art_shader(self, images, use_aspect_ratio, pixel_size, color_depth, palette_image=None,
-                               palette_colors=16, mask=None, envelope_json="", blend_intensity=1.0, invert=False):
+                               palette_colors=16, mask=None, envelope=None, blend_intensity=1.0, invert=False):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(images, use_aspect_ratio, pixel_size, color_depth, palette_image, palette_colors, mask, envelope_json, blend_intensity, invert)
+            return self._apply_audio_reactive(images, use_aspect_ratio, pixel_size, color_depth, palette_image, palette_colors, mask, envelope, blend_intensity, invert)
         else:
             return self._apply_static(images, use_aspect_ratio, pixel_size, color_depth, palette_image, palette_colors, mask)
 
@@ -79,7 +79,7 @@ class FL_PixelArtShader:
 
         return (torch.cat(result, dim=0),)
 
-    def _apply_audio_reactive(self, images, use_aspect_ratio, pixel_size, color_depth, palette_image, palette_colors, mask, envelope_json, blend_intensity, invert):
+    def _apply_audio_reactive(self, images, use_aspect_ratio, pixel_size, color_depth, palette_image, palette_colors, mask, envelope, blend_intensity, invert):
         """Audio-reactive pixel art effect with envelope-based blending"""
         print(f"\n{'='*60}")
         print(f"[FL_PixelArt Audio Reactive] DEBUG: Function called")
@@ -89,12 +89,10 @@ class FL_PixelArtShader:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = len(images)
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL_PixelArt Audio Reactive] Input frames: {batch_size}")
             print(f"[FL_PixelArt Audio Reactive] Envelope frames: {num_envelope_frames}")
@@ -141,7 +139,7 @@ class FL_PixelArtShader:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate blend amount
                 if invert:

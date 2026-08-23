@@ -19,7 +19,13 @@ const MIN_NODE_WIDTH = 420;
 const MIN_NODE_HEIGHT = 440;
 const MIN_PANEL_HEIGHT = 340;
 const VIDEO_EXTENSIONS = new Set(["avi", "gif", "m4v", "mkv", "mov", "mp4", "webm"]);
-const LOAD_PROGRESS_PHASES = ["preparing", "decoding frames", "sampling frames", "resizing frames", "finalizing"];
+const LOAD_PROGRESS_PHASES = [
+  { value: 0, label: "preparing" },
+  { value: 10, label: "decoding frames" },
+  { value: 75, label: "sampling frames" },
+  { value: 85, label: "resizing frames" },
+  { value: 95, label: "finalizing" },
+];
 const loadVideoPanels = new Map();
 
 function nodeKey(value) {
@@ -29,6 +35,15 @@ function nodeKey(value) {
 function eventNode(detail) {
   if (detail && typeof detail === "object") return detail.node ?? detail.node_id;
   return detail;
+}
+
+function progressPhase(phases, value) {
+  let phase = phases[0];
+  for (const candidate of phases) {
+    if (value < candidate.value) break;
+    phase = candidate;
+  }
+  return phase.label;
 }
 
 const STYLES = `
@@ -657,6 +672,13 @@ class LoadVideoPanel {
     this.executionActive = false;
     this.progressToken = 0;
     this.progressHideTimer = null;
+    this.uploadId = 0;
+    this.uploadRequest = null;
+    this.probeActive = false;
+    this.probeFailed = false;
+    this.previewLoading = false;
+    this.previewFailed = false;
+    this.previewLoadToken = null;
 
     this.node.properties ||= {};
     if (!Number.isFinite(this.node.properties.previewVolume)) this.node.properties.previewVolume = 0.8;
@@ -958,11 +980,24 @@ class LoadVideoPanel {
     this.video.addEventListener("pause", () => {
       this.playButton.textContent = "▶";
     });
+    this.video.addEventListener("loadstart", () => {
+      if (!this.video.src) return;
+      this.previewLoading = true;
+      this.previewFailed = false;
+      if (!this.uploadRequest && !this.probeActive && !this.probeFailed && !this.executionActive) {
+        this.previewLoadToken = this.beginTransientProgress("loading preview");
+      }
+    });
     this.video.addEventListener("loadedmetadata", () => {
+      this.previewLoading = false;
+      this.previewFailed = false;
       this.browserError.hidden = true;
       this.applyTrimWindow();
       this.updateTime();
       this.renderTrimTimeline();
+      if (!this.uploadRequest && !this.probeActive && !this.probeFailed) {
+        this.finishTransientProgress(this.previewLoadToken, "ready");
+      }
     });
     this.video.addEventListener("timeupdate", () => {
       const end = this.activePreviewEnd();
@@ -974,7 +1009,23 @@ class LoadVideoPanel {
       this.renderTrimTimeline();
     });
     this.video.addEventListener("error", () => {
-      if (this.video.src) this.browserError.hidden = false;
+      if (!this.video.src) return;
+      this.previewLoading = false;
+      this.previewFailed = true;
+      this.browserError.hidden = false;
+      if (!this.uploadRequest && !this.probeActive) {
+        this.failTransientProgress(this.previewLoadToken, "preview failed");
+      }
+    });
+    this.video.addEventListener("stalled", () => {
+      if (!this.previewLoading || this.uploadRequest || this.probeActive || this.probeFailed || this.executionActive) return;
+      this.previewLoadToken = this.beginTransientProgress("loading preview");
+    });
+    this.video.addEventListener("abort", () => {
+      this.previewLoading = false;
+      if (!this.uploadRequest && !this.probeActive && !this.probeFailed && !this.previewFailed && !this.executionActive) {
+        this.hideProgress();
+      }
     });
     this.trimCanvas.addEventListener("pointerdown", (event) => this.beginTrimPointer(event));
     this.trimCanvas.addEventListener("pointermove", (event) => this.moveTrimPointer(event));
@@ -1003,12 +1054,46 @@ class LoadVideoPanel {
     this.sourceAction.title = hasSource ? "Replace the selected video" : "Choose a video";
   }
 
+  cancelUpload() {
+    this.uploadId += 1;
+    if (!this.uploadRequest) return;
+    const request = this.uploadRequest;
+    this.uploadRequest = null;
+    request.abort();
+  }
+
+  sendUpload(request, file, progressToken) {
+    return new Promise((resolve, reject) => {
+      request.open("POST", api.apiURL("/upload/image"));
+      request.responseType = "json";
+      request.upload.addEventListener("progress", (event) => {
+        if (!event.lengthComputable || event.total <= 0) return;
+        const percent = Math.min(100, Math.round(event.loaded / event.total * 100));
+        this.updateTransientProgress(progressToken, event.loaded, event.total, `uploading ${percent}%`);
+      });
+      request.addEventListener("load", () => {
+        const payload = request.response || {};
+        if (request.status >= 200 && request.status < 300) resolve(payload);
+        else reject(new Error(payload.error || `Upload failed (${request.status}).`));
+      });
+      request.addEventListener("error", () => reject(new Error("Video upload failed.")));
+      request.addEventListener("abort", () => reject(new DOMException("Video upload aborted.", "AbortError")));
+
+      const body = new FormData();
+      body.append("image", file);
+      body.append("type", "input");
+      request.send(body);
+    });
+  }
+
   async uploadFile(file) {
     if (!supportedVideoFile(file)) {
       this.showError("Choose a supported video file.");
       return;
     }
 
+    this.cancelUpload();
+    const uploadId = this.uploadId;
     const previousSource = this.videoWidget.value;
     this.clearError();
     this.setStatus("busy", "uploading");
@@ -1016,25 +1101,27 @@ class LoadVideoPanel {
     this.dropTitle.textContent = `Uploading ${file.name}`;
     this.dropHelp.textContent = "Copying into ComfyUI input…";
     const progressToken = this.beginTransientProgress("uploading");
+    const request = new XMLHttpRequest();
+    this.uploadRequest = request;
     this.setObjectPreview(file);
 
     try {
-      const body = new FormData();
-      body.append("image", file);
-      body.append("type", "input");
-      const response = await api.fetchApi("/upload/image", { method: "POST", body });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || `Upload failed (${response.status}).`);
+      const payload = await this.sendUpload(request, file, progressToken);
+      if (this.disposed || uploadId !== this.uploadId) return;
+      this.uploadRequest = null;
       const path = [payload.subfolder, payload.name].filter(Boolean).join("/").replace(/\\/g, "/");
       this.addVideoOption(path);
       await this.selectSource(path);
     } catch (error) {
+      if (this.disposed || uploadId !== this.uploadId || error.name === "AbortError") return;
+      this.uploadRequest = null;
       const message = error.message || "Video upload failed.";
       if (previousSource) await this.selectSource(previousSource);
       else this.removeSource(false);
       this.showError(message);
       this.failProgress("upload failed");
     } finally {
+      if (this.uploadRequest === request) this.uploadRequest = null;
       this.finishTransientProgress(progressToken);
     }
   }
@@ -1055,6 +1142,7 @@ class LoadVideoPanel {
   }
 
   async selectSource(path, markGraph = true) {
+    this.cancelUpload();
     if (!path) {
       this.removeSource(markGraph);
       return;
@@ -1073,7 +1161,13 @@ class LoadVideoPanel {
   }
 
   removeSource(markGraph = true) {
+    this.cancelUpload();
     this.probeId += 1;
+    this.probeActive = false;
+    this.probeFailed = false;
+    this.previewLoading = false;
+    this.previewFailed = false;
+    this.previewLoadToken = null;
     this.progressToken += 1;
     this.executionActive = false;
     this.hideProgress();
@@ -1110,6 +1204,10 @@ class LoadVideoPanel {
       timestamp: Date.now(),
     });
     this.video.src = api.apiURL(`/view?${params.toString()}`);
+    this.previewLoading = true;
+    this.previewFailed = false;
+    this.probeFailed = false;
+    this.previewLoadToken = this.beginTransientProgress("loading preview");
     this.video.load();
     this.browserError.hidden = true;
     this.dropZone.hidden = true;
@@ -1118,6 +1216,8 @@ class LoadVideoPanel {
 
   async probeSource(path) {
     const probeId = ++this.probeId;
+    this.probeActive = true;
+    this.probeFailed = false;
     const progressToken = this.beginTransientProgress("probing");
     try {
       const params = new URLSearchParams({ filename: path });
@@ -1137,9 +1237,13 @@ class LoadVideoPanel {
       this.applyTrimWindow();
       this.updateMemoryEstimate();
       this.clearError();
+      this.probeActive = false;
+      this.probeFailed = false;
       this.finishTransientProgress(progressToken, "ready");
     } catch (error) {
       if (this.disposed || probeId !== this.probeId) return;
+      this.probeActive = false;
+      this.probeFailed = true;
       this.sourceInfo = null;
       this.showError(error.message || "Could not inspect video.");
       this.failTransientProgress(progressToken, "probe failed");
@@ -1599,8 +1703,11 @@ class LoadVideoPanel {
     this.progress.dataset.indeterminate = String(indeterminate);
     this.progress.setAttribute("aria-valuemin", "0");
     this.progress.setAttribute("aria-valuemax", String(total));
-    this.progress.setAttribute("aria-valuenow", String(current));
+    this.progress.setAttribute("aria-valuetext", label);
+    if (indeterminate) this.progress.removeAttribute("aria-valuenow");
+    else this.progress.setAttribute("aria-valuenow", String(current));
     this.progressFill.style.width = `${current / total * 100}%`;
+    this.preview.setAttribute("aria-busy", String(state === "active"));
     if (state === "error") this.setStatus("error", label);
     else if (state === "complete") this.setStatus("ready", label);
     else this.setStatus("busy", label);
@@ -1611,6 +1718,7 @@ class LoadVideoPanel {
     this.progressHideTimer = null;
     this.progress.hidden = true;
     this.progressFill.style.width = "0%";
+    this.preview.setAttribute("aria-busy", "false");
   }
 
   scheduleProgressHide() {
@@ -1627,8 +1735,22 @@ class LoadVideoPanel {
     return token;
   }
 
+  updateTransientProgress(token, value, max, label) {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(value, max, label, "active");
+  }
+
   finishTransientProgress(token, label = "ready") {
     if (this.executionActive || token !== this.progressToken) return;
+    if (this.previewFailed) {
+      this.showProgress(1, 1, "preview failed", "error");
+      return;
+    }
+    if (this.previewLoading) {
+      this.previewLoadToken = ++this.progressToken;
+      this.showProgress(0, 1, "loading preview", "active", true);
+      return;
+    }
     this.showProgress(1, 1, label, "complete");
     this.scheduleProgressHide();
   }
@@ -1641,18 +1763,18 @@ class LoadVideoPanel {
   beginExecution() {
     this.progressToken += 1;
     this.executionActive = true;
-    this.showProgress(0, LOAD_PROGRESS_PHASES.length, LOAD_PROGRESS_PHASES[0], "active", true);
+    this.showProgress(0, 100, LOAD_PROGRESS_PHASES[0].label, "active", true);
   }
 
   updateExecutionProgress(value, max) {
     this.executionActive = true;
-    const total = Math.max(1, Number(max) || LOAD_PROGRESS_PHASES.length);
+    const total = Math.max(1, Number(max) || 100);
     const current = Math.max(0, Math.min(total, Number(value) || 0));
     if (current >= total) {
       this.finishExecution("loaded");
       return;
     }
-    const label = LOAD_PROGRESS_PHASES[Math.min(LOAD_PROGRESS_PHASES.length - 1, Math.floor(current))];
+    const label = progressPhase(LOAD_PROGRESS_PHASES, current / total * 100);
     this.showProgress(current, total, label, "active");
   }
 
@@ -1716,7 +1838,10 @@ class LoadVideoPanel {
 
   dispose() {
     this.disposed = true;
+    this.cancelUpload();
     this.probeId += 1;
+    this.probeActive = false;
+    this.probeFailed = false;
     loadVideoPanels.delete(nodeKey(this.node.id));
     if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
     document.removeEventListener("pointerdown", this.handleDocumentPointerDown);

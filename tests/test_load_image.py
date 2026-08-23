@@ -246,6 +246,28 @@ class LoadImageExecutionTests(unittest.TestCase):
 
 
 class LoadImageFrontendTests(unittest.TestCase):
+    def test_frontend_routes_selected_image_paste_without_native_preview(self):
+        script = (pathlib.Path(__file__).parents[1] / "web" / "nodes" / "image" / "FL_LoadImage.js").read_text(encoding="utf-8")
+
+        for behavior in (
+            "node.pasteFiles = pasteFiles",
+            'this.uploadFile(file, "clipboard")',
+            'body.append("subfolder", "pasted")',
+            "clipboardImageFile(file)",
+            "node.pasteFiles === pasteFiles",
+            'document.addEventListener("paste", this.handleDocumentPaste, true)',
+            'document.removeEventListener("paste", this.handleDocumentPaste, true)',
+            "app.canvas?.current_node !== this.node",
+            "event.stopImmediatePropagation()",
+            "press Ctrl+V",
+        ):
+            with self.subTest(behavior=behavior):
+                self.assertIn(behavior, script)
+
+        self.assertNotIn('node.previewMediaType = "image"', script)
+        self.assertNotIn("originalPreviewMediaType", script)
+        self.assertNotIn("navigator.clipboard", script)
+
     def test_frontend_contains_source_preview_resize_and_lifecycle_contract(self):
         script = (pathlib.Path(__file__).parents[1] / "web" / "nodes" / "image" / "FL_LoadImage.js").read_text(encoding="utf-8")
 

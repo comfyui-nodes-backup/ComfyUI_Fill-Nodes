@@ -4,6 +4,7 @@ import { parseEnvelopeLayers } from "./audio_envelope.js";
 import { parseTimeline } from "./audio_prompt_timeline.js";
 import { BeatPromptSequencer } from "./audio_prompt_sequencer_editor.js";
 import { FORMAT_VERSION } from "./audio_prompt_sequencer_format.js";
+import { BeatPromptWriter } from "./audio_prompt_writer.js";
 
 const INSTANCES = new Map();
 const MEDIA_FILE_RE = /\.(?:aac|aiff?|flac|m4a|mka|mkv|mov|mp3|mp4|oga|ogg|opus|wav|webm|wma)$/i;
@@ -38,11 +39,13 @@ function setWidgetValue(widget, value) {
   widget.callback?.call(widget, value);
 }
 
-function compactStatusText(widgets, editor = null, payload = null) {
+function compactStatusText(node, widgets, editor = null, payload = null) {
   const audio = filenameFromPath(widgets.audioFile?.value) || "No audio selected";
   const frames = Math.max(0, Math.round(finiteNumber(widgets.sequenceDuration?.value)));
   const envelopeCount = (editor?.envelopeSlots || parseEnvelopeLayers(widgets.envelopeLayers?.value))
     .filter((layer) => layer?.enabled).length;
+  const lyricCount = editor?.lyricsTimeline?.segments?.length ??
+    node.properties?.flBeatPromptSequencer?.lyricsTimeline?.segments?.length ?? 0;
   let promptCount = editor?.clips?.length;
   if (!Number.isFinite(promptCount)) {
     try {
@@ -61,11 +64,12 @@ function compactStatusText(widgets, editor = null, payload = null) {
   );
   return `${audio} · ${promptCount} prompt${promptCount === 1 ? "" : "s"} · ` +
     `${envelopeCount} envelope${envelopeCount === 1 ? "" : "s"} · ` +
+    `${lyricCount} lyric${lyricCount === 1 ? "" : "s"} · ` +
     `${frames || "auto"} frames${bpm > 0 ? ` · ${bpm.toFixed(2)} BPM` : ""}`;
 }
 
 function updateCompactStatus(node, widgets, statusWidget, editor = null, payload = null) {
-  statusWidget.value = compactStatusText(widgets, editor, payload);
+  statusWidget.value = compactStatusText(node, widgets, editor, payload);
   app.graph?.setDirtyCanvas?.(true, false);
 }
 
@@ -75,10 +79,14 @@ class BeatPromptSequencerModal {
     this.widgets = widgets;
     this.statusWidget = statusWidget;
     this.editor = null;
+    this.writer = null;
     this.libraryEntries = [];
     this.localEntries = [];
     this.libraryMode = "library";
     this.libraryCollapsed = Boolean(node.properties?.flBeatPromptSequencer?.libraryCollapsed);
+    this.writerOpen = Boolean(node.properties?.flBeatPromptSequencer?.writerOpen);
+    this.writerActivity = { phase: "idle", label: "" };
+    this.writerActivityTimer = null;
     this.widgetRestorers = [];
     this.previousBodyOverflow = "";
     this.closed = false;
@@ -98,6 +106,15 @@ class BeatPromptSequencerModal {
             <div class="flbps-modal-subtitle" data-role="modal-subtitle"></div>
           </div>
           <span class="flbps-spacer"></span>
+          <div class="flbps-history-controls" role="group" aria-label="Edit history">
+            <button class="flbps-button" data-action="undo" disabled>Undo</button>
+            <button class="flbps-button" data-action="redo" disabled>Redo</button>
+          </div>
+          <button class="flbps-button flbps-writer-toggle" data-action="toggle-writer" data-writer-state="idle" aria-expanded="false">
+            <i class="flbps-writer-toggle-indicator" aria-hidden="true"></i>
+            <span data-role="writer-toggle-label">Writer</span>
+            <small data-role="writer-toggle-detail" aria-live="polite" hidden></small>
+          </button>
           <button class="flbps-button primary flbps-modal-close" data-action="modal-close">Done</button>
         </div>
         <div class="flbps-modal-main">
@@ -142,6 +159,7 @@ class BeatPromptSequencerModal {
             <button class="flbps-sidebar-toggle" data-action="toggle-library" type="button" aria-expanded="true" aria-label="Hide audio library and sequence settings" title="Hide audio library and sequence settings">&lsaquo;</button>
           </aside>
           <main class="flbps-editor-host" data-role="editor-host"></main>
+          <aside class="flbps-writer-host" data-role="writer-host"></aside>
         </div>
       </div>
     `;
@@ -154,8 +172,16 @@ class BeatPromptSequencerModal {
     this.libraryMessage = this.overlay.querySelector('[data-role="library-message"]');
     this.dropZone = this.overlay.querySelector('[data-role="drop-zone"]');
     this.editorHost = this.overlay.querySelector('[data-role="editor-host"]');
+    this.writerHost = this.overlay.querySelector('[data-role="writer-host"]');
+    this.writerButton = this.overlay.querySelector('[data-action="toggle-writer"]');
+    this.undoButton = this.overlay.querySelector('[data-action="undo"]');
+    this.redoButton = this.overlay.querySelector('[data-action="redo"]');
+    this.writerButtonLabel = this.writerButton.querySelector('[data-role="writer-toggle-label"]');
+    this.writerButtonDetail = this.writerButton.querySelector('[data-role="writer-toggle-detail"]');
+    this.writerButtonIndicator = this.writerButton.querySelector(".flbps-writer-toggle-indicator");
     this.libraryToggle = this.overlay.querySelector('[data-action="toggle-library"]');
     this.syncLibraryVisibility();
+    this.syncWriterVisibility();
 
     this.fileInput = document.createElement("input");
     this.fileInput.type = "file";
@@ -169,6 +195,15 @@ class BeatPromptSequencerModal {
     this.library.append(this.fileInput, this.folderInput);
 
     this.overlay.querySelector('[data-action="modal-close"]').addEventListener("click", () => this.close());
+    this.undoButton.addEventListener("click", () => {
+      this.editor?.commitFocusedEdit();
+      this.editor?.undo();
+    });
+    this.redoButton.addEventListener("click", () => {
+      this.editor?.commitFocusedEdit();
+      this.editor?.redo();
+    });
+    this.writerButton.addEventListener("click", () => this.toggleWriter());
     this.libraryToggle.addEventListener("click", () => this.toggleLibrary());
     this.overlay.addEventListener("pointerdown", (event) => {
       if (event.target === this.overlay) this.close();
@@ -177,7 +212,19 @@ class BeatPromptSequencerModal {
       this.shell.addEventListener(type, (event) => event.stopPropagation(), { passive: type === "wheel" });
     }
     this.keyHandler = (event) => {
-      if (event.key === "Escape") {
+      const editingText = event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement ||
+        event.target instanceof HTMLSelectElement ||
+        event.target?.isContentEditable;
+      const command = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+      if (command && !event.altKey && !editingText &&
+          (key === "z" || (key === "y" && !event.shiftKey))) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (key === "y" || event.shiftKey) this.editor?.redo();
+        else this.editor?.undo();
+      } else if (event.key === "Escape") {
         event.preventDefault();
         this.close();
       } else if ((event.code === "Space" || event.key === " ") &&
@@ -235,8 +282,16 @@ class BeatPromptSequencerModal {
       container: this.editorHost,
       widgets: this.widgets,
       onStateChange: () => this.handleEditorState(),
+      onHistoryChange: () => this.syncHistoryControls(),
+    });
+    this.writer = new BeatPromptWriter({
+      node: this.node,
+      editor: this.editor,
+      container: this.writerHost,
+      onActivityChange: (activity) => this.updateWriterActivity(activity),
     });
     INSTANCES.set(this.node.id, this.editor);
+    this.syncHistoryControls();
     this.bindSettings();
     this.syncSettings();
     const pending = this.node._flSequencerExecutionMessage;
@@ -253,6 +308,15 @@ class BeatPromptSequencerModal {
   }
 
   bindSettings() {
+    const labels = {
+      fps: "Change FPS",
+      length: "Change sequence length",
+      "fade-in": "Change default fade in",
+      "fade-out": "Change default fade out",
+      curve: "Change fade curve",
+      "analysis-source": "Change analysis source",
+      "half-time": "Toggle half-time",
+    };
     this.settingSpecs = {
       fps: { widget: this.widgets.fps, parse: (value) => clamp(finiteNumber(value, 24), 1, 240) },
       length: { widget: this.widgets.sequenceDuration, parse: (value) => clamp(Math.round(finiteNumber(value)), 0, 864000) },
@@ -266,7 +330,7 @@ class BeatPromptSequencerModal {
       const control = this.overlay.querySelector(`[data-setting="${name}"]`);
       control.addEventListener("change", () => {
         const raw = control.type === "checkbox" ? control.checked : control.value;
-        setWidgetValue(spec.widget, spec.parse(raw));
+        this.editor.runEdit(labels[name], () => setWidgetValue(spec.widget, spec.parse(raw)));
       });
     }
     const syncedWidgets = [
@@ -304,6 +368,17 @@ class BeatPromptSequencerModal {
 
   handleEditorState() {
     this.syncSettings();
+    this.syncHistoryControls();
+  }
+
+  syncHistoryControls() {
+    if (!this.undoButton || !this.redoButton) return;
+    const undoLabel = this.editor?.nextUndoLabel() || "";
+    const redoLabel = this.editor?.nextRedoLabel() || "";
+    this.undoButton.disabled = !this.editor?.canUndo();
+    this.redoButton.disabled = !this.editor?.canRedo();
+    this.undoButton.title = undoLabel ? `Undo ${undoLabel} (Ctrl/Cmd+Z)` : "Nothing to undo";
+    this.redoButton.title = redoLabel ? `Redo ${redoLabel} (Ctrl/Cmd+Shift+Z or Ctrl+Y)` : "Nothing to redo";
   }
 
   syncLibraryVisibility() {
@@ -325,6 +400,66 @@ class BeatPromptSequencerModal {
       libraryCollapsed: this.libraryCollapsed,
     };
     this.syncLibraryVisibility();
+    this.node.graph?.change?.();
+    setTimeout(() => this.editor?.scheduleDraw(), 180);
+  }
+
+  syncWriterVisibility() {
+    this.shell.classList.toggle("writer-open", this.writerOpen);
+    this.writerButton?.classList.toggle("active", this.writerOpen);
+    if (this.writerButton) {
+      this.writerButton.setAttribute("aria-expanded", String(this.writerOpen));
+      this.renderWriterActivity();
+    }
+  }
+
+  updateWriterActivity(activity) {
+    if (this.closed) return;
+    clearTimeout(this.writerActivityTimer);
+    this.writerActivityTimer = null;
+    this.writerActivity = activity || { phase: "idle", label: "" };
+    this.renderWriterActivity();
+    if (["applied", "complete", "no_changes", "stopped"].includes(this.writerActivity.phase)) {
+      this.writerActivityTimer = setTimeout(() => {
+        this.writerActivity = { phase: "idle", label: "" };
+        this.renderWriterActivity();
+      }, this.writerActivity.phase === "applied" ? 5000 : 3500);
+    }
+  }
+
+  renderWriterActivity() {
+    if (!this.writerButton) return;
+    const activity = this.writerActivity || { phase: "idle", label: "" };
+    const active = ["connecting", "reading", "drafting", "preparing", "editing", "applying", "stopping"].includes(activity.phase);
+    const action = this.writerOpen ? "Hide Writer" : "Writer";
+    const progress = activity.progressTotal
+      ? `${activity.progressCompleted || 0}/${activity.progressTotal}`
+      : activity.label;
+    this.writerButton.dataset.writerState = activity.phase;
+    this.writerButton.classList.toggle("writer-running", active);
+    this.writerButtonLabel.textContent = action;
+    this.writerButtonDetail.textContent = progress ? `\u00b7 ${progress}` : "";
+    this.writerButtonDetail.hidden = !progress || activity.phase === "idle";
+    this.writerButtonIndicator.textContent = ["applied", "complete", "no_changes"].includes(activity.phase)
+      ? "\u2713"
+      : activity.phase === "error"
+      ? "!"
+      : "";
+    this.writerButton.setAttribute(
+      "aria-label",
+      `${this.writerOpen ? "Hide" : "Show"} Beat Writer${activity.label ? `. ${activity.label}` : ""}`,
+    );
+  }
+
+  toggleWriter() {
+    this.writerOpen = !this.writerOpen;
+    this.node.properties = this.node.properties || {};
+    this.node.properties.flBeatPromptSequencer = {
+      ...(this.node.properties.flBeatPromptSequencer || {}),
+      formatVersion: FORMAT_VERSION,
+      writerOpen: this.writerOpen,
+    };
+    this.syncWriterVisibility();
     this.node.graph?.change?.();
     setTimeout(() => this.editor?.scheduleDraw(), 180);
   }
@@ -489,8 +624,11 @@ class BeatPromptSequencerModal {
   close() {
     if (this.closed) return;
     this.closed = true;
+    clearTimeout(this.writerActivityTimer);
     for (const restore of this.widgetRestorers.reverse()) restore();
     this.widgetRestorers = [];
+    this.writer?.destroy();
+    this.writer = null;
     if (this.editor) {
       this.editor.saveViewState();
       this.editor.dispose();

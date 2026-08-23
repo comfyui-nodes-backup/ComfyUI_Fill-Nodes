@@ -166,7 +166,6 @@ from .nodes.ksamplers.FL_KSamplerXYZPlot import FL_KSamplerXYZPlot
 # LOADERS NODES
 from .nodes.loaders.FL_NodeLoader import FL_NodeLoader
 from .nodes.loaders.FL_NodePackLoader import FL_NodePackLoader
-from .nodes.loaders.FL_MiniMaxMusic3Loader import FL_MiniMaxMusic3Loader
 from .nodes.loaders.FL_UpscaleModel import FL_UpscaleModel
 
 # PDF NODES
@@ -379,7 +378,6 @@ NODE_CLASS_MAPPINGS = {
     "FL_VideoCombine": FL_VideoCombine,
     "FL_Padding": FL_Padding,
     "FL_GoogleDriveDownloader": FL_GoogleDriveDownloader,
-    "FL_MiniMaxMusic3Loader": FL_MiniMaxMusic3Loader,
     "FL_NodeLoader": FL_NodeLoader,
     "FL_NodePackLoader": FL_NodePackLoader,
     "FL_API_Base64_ImageLoader": FL_API_Base64_ImageLoader,
@@ -588,7 +586,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_VideoCombine": "FL Video Combine",
     "FL_Padding": "FL Padding",
     "FL_GoogleDriveDownloader": "FL Google Drive Downloader",
-    "FL_MiniMaxMusic3Loader": "FL MiniMax Music 3 Loader",
     "FL_NodeLoader": "FL Node Loader",
     "FL_NodePackLoader": "FL Node Pack Loader",
     "FL_API_Base64_ImageLoader": "FL API Base64 Image Loader",

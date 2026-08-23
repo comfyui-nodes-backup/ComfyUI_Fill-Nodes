@@ -1,12 +1,13 @@
 import torch
 import numpy as np
-import json
 from PIL import Image
 import sys
 import OpenGL.GL as gl
 import glfw
 import ctypes
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 
 VERTEX_SHADER = """
@@ -75,9 +76,8 @@ class FL_InfiniteZoom:
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {
-                    "default": "",
-                    "description": "Optional: Envelope JSON for audio-reactive blending"
+                "envelope": ("FL_AUDIO_ENVELOPE", {
+                    "description": "Optional FL audio envelope for reactive blending"
                 }),
                 "blend_intensity": ("FLOAT", {
                     "default": 1.0,
@@ -108,12 +108,12 @@ class FL_InfiniteZoom:
     FUNCTION = "apply_shader"
     CATEGORY = "🏵️Fill Nodes/VFX"
 
-    def apply_shader(self, images, envelope_json="", blend_intensity=1.0, invert=False, mask=None, scale=2.0, mirror="off", mirror_warp=1.0, iterations=10, speed=1.0, fps=30):
+    def apply_shader(self, images, envelope=None, blend_intensity=1.0, invert=False, mask=None, scale=2.0, mirror="off", mirror_warp=1.0, iterations=10, speed=1.0, fps=30):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(images, envelope_json, blend_intensity, invert, mask, scale, mirror, mirror_warp, iterations, speed, fps)
+            return self._apply_audio_reactive(images, envelope, blend_intensity, invert, mask, scale, mirror, mirror_warp, iterations, speed, fps)
         else:
             return self._apply_static(images, mask, scale, mirror, mirror_warp, iterations, speed, fps)
 
@@ -153,7 +153,7 @@ class FL_InfiniteZoom:
 
         return (torch.cat(result, dim=0),)
 
-    def _apply_audio_reactive(self, images, envelope_json, blend_intensity, invert, mask, scale, mirror, mirror_warp, iterations, speed, fps):
+    def _apply_audio_reactive(self, images, envelope, blend_intensity, invert, mask, scale, mirror, mirror_warp, iterations, speed, fps):
         """Audio-reactive infinite zoom effect with envelope-based blending"""
         print(f"\n{'='*60}")
         print(f"[FL_InfiniteZoom Audio Reactive] DEBUG: Function called")
@@ -163,12 +163,10 @@ class FL_InfiniteZoom:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = len(images)
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL_InfiniteZoom Audio Reactive] Input frames: {batch_size}")
             print(f"[FL_InfiniteZoom Audio Reactive] Envelope frames: {num_envelope_frames}")
@@ -224,7 +222,7 @@ class FL_InfiniteZoom:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate blend amount
                 if invert:

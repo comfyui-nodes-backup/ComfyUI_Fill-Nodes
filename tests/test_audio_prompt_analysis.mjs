@@ -7,13 +7,20 @@ const coordinatesSource = await readFile(
   "utf8",
 );
 const coordinatesURL = `data:text/javascript;base64,${Buffer.from(coordinatesSource).toString("base64")}`;
+const songMapSource = await readFile(
+  new URL("../web/nodes/audio/audio_prompt_song_map.js", import.meta.url),
+  "utf8",
+);
+const songMapURL = `data:text/javascript;base64,${Buffer.from(songMapSource).toString("base64")}`;
 const analysisSource = await readFile(
   new URL("../web/nodes/audio/audio_prompt_analysis.js", import.meta.url),
   "utf8",
 );
 const analysis = await import(
   `data:text/javascript;base64,${Buffer.from(
-    analysisSource.replace("./audio_timeline_coordinates.js", coordinatesURL),
+    analysisSource
+      .replace("./audio_timeline_coordinates.js", coordinatesURL)
+      .replace("./audio_prompt_song_map.js", songMapURL),
   ).toString("base64")}`
 );
 
@@ -35,21 +42,6 @@ test("waveform previews are validated and cropped without changing scale", () =>
   });
 });
 
-test("decoded audio buffers produce bounded waveform previews", () => {
-  const samples = new Float32Array([-2, -0.5, 0.25, 2, -0.25, 0.5]);
-  const preview = analysis.waveformPreviewFromBuffer({
-    duration: 0.05,
-    length: samples.length,
-    numberOfChannels: 1,
-    getChannelData: () => samples,
-  });
-
-  assert.equal(preview.version, 1);
-  assert.equal(preview.peaks.length, 6);
-  assert.deepEqual(preview.peaks.slice(0, 2), [-32767, -16383]);
-  assert.ok(preview.peaks.every((value) => value >= -32767 && value <= 32767));
-});
-
 test("source analysis accepts snake and camel case without leaking input shape", () => {
   const value = analysis.sourceAnalysisValue({
     type: "fl_audio_source_analysis",
@@ -60,6 +52,12 @@ test("source analysis accepts snake and camel case without leaking input shape",
     detectedBeatConfidences: [0.9],
     audioFile: "song.wav",
     cacheKey: "cache",
+    songMap: {
+      type: "fl_audio_song_map",
+      version: 1,
+      sourceDuration: 12,
+      sections: [],
+    },
   });
 
   assert.equal(value.duration, 12);
@@ -67,6 +65,7 @@ test("source analysis accepts snake and camel case without leaking input shape",
   assert.deepEqual(value.beatTimes, [1, 2]);
   assert.deepEqual(value.detectedBeatConfidences, [0.9]);
   assert.equal(value.audioFile, "song.wav");
+  assert.equal(value.songMap.duration, 12);
   assert.equal(value.supportsHalfTime, true);
   assert.equal(analysis.sourceAnalysisValue({ type: "fl_audio_source_analysis", version: 2 }), null);
 });

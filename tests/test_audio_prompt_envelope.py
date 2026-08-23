@@ -19,7 +19,7 @@ prompt_envelope = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = prompt_envelope
 SPEC.loader.exec_module(prompt_envelope)
 REACTIVE_SPEC = importlib.util.spec_from_file_location(
-    "fl_audio_reactive_envelope_tests",
+    f"{PACKAGE_NAME}.FL_Audio_Reactive_Envelope",
     AUDIO_PATH / "FL_Audio_Reactive_Envelope.py",
 )
 reactive_envelope = importlib.util.module_from_spec(REACTIVE_SPEC)
@@ -51,12 +51,14 @@ class BeatPromptEnvelopeTests(unittest.TestCase):
         ).result
 
         envelope = output[0]
-        envelope_json = json.loads(output[1])
+        audio_envelope = output[1]
         self.assertEqual(envelope["type"], "fl_prompt_envelope")
         self.assertEqual(envelope["version"], 1)
         self.assertEqual(len(envelope["weights"]), 48)
-        self.assertEqual(envelope_json["fps"], 24.0)
-        self.assertEqual(envelope_json["duration"], 2.0)
+        self.assertEqual(audio_envelope["type"], "fl_audio_envelope")
+        self.assertEqual(audio_envelope["fps"], 24.0)
+        self.assertEqual(audio_envelope["duration"], 2.0)
+        self.assertLessEqual(max(audio_envelope["values"]), 1.0)
         self.assertIn("2 selected hits", output[2])
         self.assertGreater(max(envelope["weights"]), 2.9)
 
@@ -70,12 +72,10 @@ class BeatPromptEnvelopeTests(unittest.TestCase):
             attack_beats=0.0,
             hold_beats=0.5,
             release_beats=1.0,
-            floor_strength=0.0,
-            peak_strength=3.0,
             curve="linear",
         )
 
-        self.assertLessEqual(max(values), 3.0)
+        self.assertLessEqual(max(values), 1.0)
 
     def test_phase_must_be_inside_stride(self):
         with self.assertRaisesRegex(ValueError, "smaller than beat stride"):
@@ -96,15 +96,17 @@ class BeatPromptEnvelopeTests(unittest.TestCase):
 
 class EnvelopePromptTests(unittest.TestCase):
     def test_maps_existing_envelope_to_prompt_strength(self):
-        source = json.dumps({
-            "envelope": [0.0, 0.25, 0.5, 1.0],
+        source = {
+            "type": "fl_audio_envelope",
+            "version": 1,
+            "values": [0.0, 0.25, 0.5, 1.0],
+            "total_frames": 4,
             "fps": 20,
             "duration": 0.2,
-        })
+        }
         output = prompt_envelope.FL_Audio_Envelope_Prompt.execute(
-            envelope_json=source,
+            envelope=source,
             reactive_prompt="Flash.",
-            source_fps=24.0,
             threshold=0.25,
             response_gamma=1.0,
             floor_strength=0.0,
@@ -119,11 +121,15 @@ class EnvelopePromptTests(unittest.TestCase):
         self.assertAlmostEqual(envelope["weights"][2], 1.0)
         self.assertEqual(envelope["weights"][3], 3.0)
 
-    def test_legacy_envelope_uses_fallback_fps(self):
-        values, fps, duration = prompt_envelope._load_envelope(
-            json.dumps({"envelope": [0.0, 1.0, 0.0]}),
-            30.0,
-        )
+    def test_typed_envelope_keeps_timing_metadata(self):
+        values, fps, duration = prompt_envelope._load_envelope({
+            "type": "fl_audio_envelope",
+            "version": 1,
+            "values": [0.0, 1.0, 0.0],
+            "total_frames": 3,
+            "fps": 30.0,
+            "duration": 0.1,
+        })
 
         self.assertEqual(values, [0.0, 1.0, 0.0])
         self.assertEqual(fps, 30.0)
@@ -168,7 +174,8 @@ class ExistingReactiveEnvelopeTests(unittest.TestCase):
             kick_sustain_level=0.0,
             kick_release_frames=1,
         )
-        data = json.loads(kick)
+        data = kick
+        self.assertEqual(data["type"], "fl_audio_envelope")
         self.assertEqual(data["fps"], 24)
         self.assertEqual(data["duration"], 0.11)
         self.assertEqual(data["total_frames"], 3)

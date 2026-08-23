@@ -1,10 +1,11 @@
 import torch
 import numpy as np
-import json
 from PIL import Image
 from glitch_this import ImageGlitcher
 
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 class FL_Glitch:
     def __init__(self):
@@ -18,9 +19,8 @@ class FL_Glitch:
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {
-                    "default": "",
-                    "description": "Optional: Envelope JSON for audio-reactive blending"
+                "envelope": ("FL_AUDIO_ENVELOPE", {
+                    "description": "Optional FL audio envelope for reactive blending"
                 }),
                 "blend_intensity": ("FLOAT", {
                     "default": 1.0,
@@ -77,12 +77,12 @@ class FL_Glitch:
     def s2b(self, v):
         return v == "Enable"
 
-    def glitch(self, images, envelope_json="", blend_intensity=1.0, invert=False, mask=None, glitch_amount=1, color_offset="Disable", seed=0):
+    def glitch(self, images, envelope=None, blend_intensity=1.0, invert=False, mask=None, glitch_amount=1, color_offset="Disable", seed=0):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(images, glitch_amount, color_offset, seed, envelope_json, blend_intensity, invert, mask)
+            return self._apply_audio_reactive(images, glitch_amount, color_offset, seed, envelope, blend_intensity, invert, mask)
         else:
             return self._apply_static(images, glitch_amount, color_offset, seed, mask)
 
@@ -144,7 +144,7 @@ class FL_Glitch:
         out = torch.cat(out, 0)
         return (out,)
 
-    def _apply_audio_reactive(self, images, glitch_amount, color_offset, seed, envelope_json, blend_intensity, invert, mask=None):
+    def _apply_audio_reactive(self, images, glitch_amount, color_offset, seed, envelope, blend_intensity, invert, mask=None):
         """Audio-reactive glitch effect with envelope-based blending"""
         print(f"\n{'='*60}")
         print(f"[FL_Glitch Audio Reactive] DEBUG: Function called")
@@ -154,12 +154,10 @@ class FL_Glitch:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = len(images)
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL_Glitch Audio Reactive] Input frames: {batch_size}")
             print(f"[FL_Glitch Audio Reactive] Envelope frames: {num_envelope_frames}")
@@ -235,7 +233,7 @@ class FL_Glitch:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate blend amount
                 if invert:

@@ -227,8 +227,7 @@ class FL_VideoCombine:
     DESCRIPTION = "Combines an image batch and optional audio into an MP4 video."
 
     def combine_video(self, images, render_settings=DEFAULT_SETTINGS_JSON, audio=None, prompt=None, extra_pnginfo=None):
-        progress = ProgressBar(3)
-        progress.update_absolute(0)
+        progress = ProgressBar(100)
         settings = _parse_settings(render_settings)
         images, source_width, source_height = _prepare_images(images)
         encoded_height = int(images.shape[1])
@@ -259,7 +258,7 @@ class FL_VideoCombine:
             ),
             bit_depth=settings["bit_depth"],
         )
-        progress.update_absolute(1)
+        progress.update_absolute(10)
         video.save_to(
             output_path,
             format=Types.VideoContainer.MP4,
@@ -268,7 +267,7 @@ class FL_VideoCombine:
             crf=settings["crf"],
         )
 
-        progress.update_absolute(2)
+        progress.update_absolute(95)
         frame_count = int(images.shape[0])
         preview = {
             "filename": file,
@@ -287,7 +286,7 @@ class FL_VideoCombine:
         if output_type == "custom":
             token = register_preview_file(output_path)
             preview["preview_url"] = f"/fl/video-combine/preview/{token}"
-        progress.update_absolute(3)
+        progress.update_absolute(100)
         return {
             "ui": {"fl_video_combine": [preview]},
             "result": (output_path,),

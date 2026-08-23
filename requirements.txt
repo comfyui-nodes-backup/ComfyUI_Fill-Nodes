@@ -21,9 +21,13 @@ kornia
 opencv-python
 gdown
 open_clip_torch
-google-genai>=1.66.0,<2.0.0
+google-genai>=2.0.0,<3.0.0
 google-cloud-storage
 fal-client
 runwayml
 httpx
+anthropic>=0.71.0,<1.0
+claude-agent-sdk>=0.2.120,<0.3
+keyring>=25,<26
+openai-codex==0.144.4
 huggingface_hub

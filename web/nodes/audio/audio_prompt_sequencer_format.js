@@ -1,6 +1,6 @@
-export const FORMAT_VERSION = 16;
+export const FORMAT_VERSION = 17;
 
-const COMPATIBLE_FORMAT_VERSIONS = new Set([6, 7, 8, 9, 10, 11, 12, 13, 14, 15, FORMAT_VERSION]);
+const COMPATIBLE_FORMAT_VERSIONS = new Set([6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, FORMAT_VERSION]);
 const LEGACY_BPM_METHODS = new Set(["beat_intervals", "onset_strength"]);
 
 function finiteNumber(value, fallback = 0) {

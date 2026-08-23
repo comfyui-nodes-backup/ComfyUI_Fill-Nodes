@@ -14,7 +14,14 @@ from .audio_timeline import (
     DETECTOR_VERSION,
     analyze_audio_file,
     apply_beat_offset,
+    apply_half_time,
     cached_analysis_audio_file,
+)
+from .audio_envelope import (
+    FLAudioEnvelope,
+    FLPromptEnvelopeSet,
+    make_audio_envelope,
+    make_prompt_envelope_set,
 )
 
 
@@ -25,12 +32,234 @@ _HEADER = re.compile(
 )
 _HEADER_START = re.compile(r"^\s*\[\s*[0-9]+(?:\.[0-9]+)?\s*-")
 _EPS = 1e-6
+_ENVELOPE_SOURCES = {
+    "beat_grid": "beat_times",
+    "downbeat": "downbeat_times",
+    "raw_beat": "detected_beat_times",
+    "onset": "onset_times",
+    "kick": "kick_times",
+    "snare": "snare_times",
+    "hihat": "hihat_times",
+}
 _DEFAULT_TIMELINE = (
     "[0 - 48 | fade_in=6 | fade_out=6]\n"
     "The subject slowly turns toward camera.\n\n"
     "[48 - 96 | fade_in=6 | fade_out=6]\n"
     "The camera pushes forward on the beat."
 )
+
+
+def _whole_number(value, name, minimum=0, maximum=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Envelope {name} must be a whole number.") from error
+    if not math.isfinite(number) or abs(number - round(number)) > _EPS:
+        raise ValueError(f"Envelope {name} must be a whole number.")
+    number = round(number)
+    if number < minimum or (maximum is not None and number > maximum):
+        limit = f" between {minimum} and {maximum}" if maximum is not None else f" at least {minimum}"
+        raise ValueError(f"Envelope {name} must be{limit}.")
+    return number
+
+
+def _envelope_strength(value, name):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Envelope {name} must be a number.") from error
+    if not math.isfinite(number) or number < 0 or number > 8:
+        raise ValueError(f"Envelope {name} must be between 0 and 8.")
+    return number
+
+
+def _load_envelope_layers(value):
+    if not value:
+        return [None, None, None]
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Envelope settings are not valid JSON: {error.msg}.") from error
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("Envelope settings must use version 1.")
+    slots = value.get("slots")
+    if not isinstance(slots, list) or len(slots) > 3:
+        raise ValueError("Envelope settings must contain up to three slots.")
+
+    resolved = []
+    for position in range(3):
+        slot = slots[position] if position < len(slots) else None
+        if slot is None:
+            resolved.append(None)
+            continue
+        if not isinstance(slot, dict):
+            raise ValueError(f"Envelope {position + 1} settings must be an object.")
+        source = str(slot.get("source", "beat_grid"))
+        if source not in _ENVELOPE_SOURCES:
+            raise ValueError(f"Envelope {position + 1} has an invalid source '{source}'.")
+        stride = _whole_number(slot.get("stride", 1), f"{position + 1} stride", 1, 64)
+        phase = _whole_number(slot.get("phase", 0), f"{position + 1} phase", 0, 63)
+        if phase >= stride:
+            raise ValueError(f"Envelope {position + 1} phase must be smaller than its stride.")
+        attack = _whole_number(slot.get("attack_frames", 0), f"{position + 1} attack", 0, 240)
+        hold = _whole_number(slot.get("hold_frames", 3), f"{position + 1} hold", 0, 240)
+        release = _whole_number(slot.get("release_frames", 6), f"{position + 1} release", 0, 240)
+        if attack + hold + release <= 0:
+            raise ValueError(f"Envelope {position + 1} needs a non-zero attack, hold, or release.")
+        curve = str(slot.get("curve", "cosine"))
+        if curve not in {"linear", "cosine"}:
+            raise ValueError(f"Envelope {position + 1} curve must be linear or cosine.")
+        floor = _envelope_strength(slot.get("floor_strength", 0.0), f"{position + 1} floor")
+        peak = _envelope_strength(slot.get("peak_strength", 3.0), f"{position + 1} peak")
+        if peak < floor:
+            raise ValueError(f"Envelope {position + 1} peak must be at least its floor.")
+        resolved.append({
+            "enabled": bool(slot.get("enabled", True)),
+            "source": source,
+            "prompt": str(slot.get("prompt", "")),
+            "stride": stride,
+            "phase": phase,
+            "attack_frames": attack,
+            "hold_frames": hold,
+            "release_frames": release,
+            "curve": curve,
+            "floor_strength": floor,
+            "peak_strength": peak,
+        })
+    return resolved
+
+
+def _envelope_curve(value, curve):
+    value = min(max(value, 0.0), 1.0)
+    if curve == "cosine":
+        return 0.5 - 0.5 * math.cos(math.pi * value)
+    return value
+
+
+def _envelope_pulse(seconds, event, attack, hold, release, curve):
+    start = event - attack
+    hold_end = event + hold
+    end = hold_end + release
+    if seconds < start or seconds >= end:
+        return 0.0
+    if seconds < event and attack > _EPS:
+        return _envelope_curve((seconds - start) / attack, curve)
+    if seconds < hold_end:
+        return 1.0
+    if release <= _EPS:
+        return 0.0
+    return 1.0 - _envelope_curve((seconds - hold_end) / release, curve)
+
+
+def _generate_envelope(events, total_frames, fps, layer):
+    values = [0.0] * total_frames
+    attack = layer["attack_frames"] / fps
+    hold = layer["hold_frames"] / fps
+    release = layer["release_frames"] / fps
+    for event in events[layer["phase"]::layer["stride"]]:
+        start = event - attack
+        end = event + hold + release
+        first = max(0, math.ceil(start * fps - 0.5 - _EPS))
+        last = min(total_frames, math.ceil(end * fps - 0.5 - _EPS))
+        for frame in range(first, last):
+            seconds = (frame + 0.5) / fps
+            values[frame] = max(
+                values[frame],
+                _envelope_pulse(seconds, event, attack, hold, release, layer["curve"]),
+            )
+    return values
+
+
+def _source_events(
+    layer,
+    beat_data,
+    internal_analysis,
+    external_beats,
+    half_time,
+    beat_offset_ms,
+    beat_grid_density,
+    fps,
+):
+    source = layer["source"]
+    source_analysis = (
+        internal_analysis.get("source_analysis")
+        if internal_analysis is not None
+        else None
+    )
+    source_start = (
+        float(internal_analysis.get("source_start", 0.0))
+        if internal_analysis is not None
+        else 0.0
+    )
+    use_full_analysis = isinstance(source_analysis, dict) and (
+        source in {"onset", "kick", "snare", "hihat"} or not external_beats
+    )
+    data = beat_data
+    if use_full_analysis:
+        data = source_analysis
+        if source in {"beat_grid", "downbeat", "raw_beat"}:
+            data = apply_beat_offset(
+                apply_half_time(source_analysis, half_time),
+                fps,
+                beat_offset_ms,
+                beat_grid_density,
+            )
+
+    key = _ENVELOPE_SOURCES[source]
+    if source in {"kick", "snare", "hihat"}:
+        values = data.get("drum_times", {}).get(key, [])
+    else:
+        values = data.get(key, [])
+    offset = source_start if use_full_analysis else 0.0
+    return [float(value) - offset for value in values]
+
+
+def _envelope_outputs(
+    layers,
+    beat_data,
+    internal_analysis,
+    external_beats,
+    half_time,
+    beat_offset_ms,
+    beat_grid_density,
+    fps,
+    duration,
+    total_frames,
+):
+    raw_envelopes = []
+    prompt_envelopes = []
+    for position, layer in enumerate(layers, 1):
+        if layer is None or not layer["enabled"]:
+            raw_envelopes.append(None)
+            continue
+        events = _source_events(
+            layer,
+            beat_data,
+            internal_analysis,
+            external_beats,
+            half_time,
+            beat_offset_ms,
+            beat_grid_density,
+            fps,
+        )
+        values = _generate_envelope(events, total_frames, fps, layer)
+        raw_envelopes.append(
+            make_audio_envelope(values, fps, duration, layer["source"], position)
+        )
+        prompt = layer["prompt"].strip()
+        if prompt:
+            floor = layer["floor_strength"]
+            span = layer["peak_strength"] - floor
+            prompt_envelopes.append({
+                "slot": position,
+                "source": layer["source"],
+                "prompt": prompt,
+                "weights": [floor + value * span for value in values],
+                "fps": fps,
+                "duration": duration,
+            })
+    return raw_envelopes, make_prompt_envelope_set(prompt_envelopes, fps, duration)
 
 
 def _number(value, name, line):
@@ -356,11 +585,12 @@ def _position_to_seconds(position, time_unit, beat_times, duration, fps, line):
     return position / fps
 
 
-def _resolve_duration(length, audio_duration, fps):
+def _resolve_duration(length, audio_duration, fps, sample_rate=None):
     if length <= 0:
         return audio_duration
     duration = length / fps
-    if duration > audio_duration + _EPS:
+    tolerance = max(_EPS, 1.0 / sample_rate) if sample_rate else _EPS
+    if duration > audio_duration + tolerance:
         raise ValueError(
             f"Beat prompt schedule length {length:g} frames at {fps:g} FPS exceeds the "
             f"audio duration {audio_duration:g}s."
@@ -665,6 +895,14 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
                         "selected local audio file after workflow widget migrations."
                     ),
                 ),
+                io.String.Input(
+                    "envelope_layers",
+                    default="",
+                    tooltip=(
+                        "Sequencer-owned reactive envelope settings. The popup editor manages "
+                        "the three fixed envelope slots automatically."
+                    ),
+                ),
             ],
             outputs=[
                 FLPromptSchedule.Output(
@@ -682,6 +920,22 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
                 io.Float.Output(
                     display_name="BPM",
                     tooltip="Detected musical tempo after applying the Half-time option.",
+                ),
+                FLAudioEnvelope.Output(
+                    display_name="envelope_1",
+                    tooltip="Normalized signal from reactive envelope slot 1.",
+                ),
+                FLAudioEnvelope.Output(
+                    display_name="envelope_2",
+                    tooltip="Normalized signal from reactive envelope slot 2.",
+                ),
+                FLAudioEnvelope.Output(
+                    display_name="envelope_3",
+                    tooltip="Normalized signal from reactive envelope slot 3.",
+                ),
+                FLPromptEnvelopeSet.Output(
+                    display_name="prompt_envelopes",
+                    tooltip="Enabled reactive prompts and their frame-aligned weights.",
                 ),
             ],
         )
@@ -705,9 +959,11 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
         beat_grid_density="every_beat",
         render_groups="",
         analysis_cache_key="",
+        envelope_layers="",
     ):
         internal_analysis = None
         cropped_audio = None
+        external_beats = bool(beat_positions)
         if not audio_file and analysis_cache_key:
             audio_file = cached_analysis_audio_file(analysis_cache_key)
         if audio_file:
@@ -761,6 +1017,7 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
             sequence_duration,
             audio_duration,
             fps,
+            cropped_audio["sample_rate"] if cropped_audio is not None else None,
         )
         parsed_sections = _apply_render_groups(
             _parse_schedule(
@@ -781,6 +1038,19 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
             duration,
         )
         total_frames = round(duration * fps)
+        layers = _load_envelope_layers(envelope_layers)
+        raw_envelopes, prompt_envelopes = _envelope_outputs(
+            layers,
+            beat_data,
+            internal_analysis,
+            external_beats,
+            half_time,
+            beat_offset_ms,
+            beat_grid_density,
+            fps,
+            duration,
+            total_frames,
+        )
         frame_sections = _frame_sections(sections, fps, total_frames)
         for section, frame_section in zip(sections, frame_sections):
             section.update(frame_section)
@@ -872,6 +1142,8 @@ class FL_Audio_Beat_Prompt_Schedule(io.ComfyNode):
             total_frames,
             cropped_audio,
             float(beat_data["bpm"]),
+            *raw_envelopes,
+            prompt_envelopes,
             ui={"fl_prompt_sequencer": [ui_payload]},
         )
 

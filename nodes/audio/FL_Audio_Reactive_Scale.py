@@ -1,10 +1,11 @@
 # FL_Audio_Reactive_Scale: Scale/zoom frames based on audio envelope
 import torch
 import torch.nn.functional as F
-import json
 import numpy as np
 from PIL import Image
 from typing import Tuple
+
+from .audio_envelope import load_audio_envelope
 
 
 class FL_Audio_Reactive_Scale:
@@ -44,7 +45,7 @@ class FL_Audio_Reactive_Scale:
         return {
             "required": {
                 "frames": ("IMAGE", {"description": "Input frames"}),
-                "envelope_json": ("STRING", {"description": "Envelope JSON from FL_Audio_Reactive_Envelope"}),
+                "envelope": ("FL_AUDIO_ENVELOPE", {"description": "Frame-aligned FL audio envelope"}),
             },
             "optional": {
                 "mask": ("IMAGE", {
@@ -79,7 +80,7 @@ class FL_Audio_Reactive_Scale:
     def apply_scale(
         self,
         frames: torch.Tensor,
-        envelope_json: str,
+        envelope,
         mask=None,
         base_scale: float = 1.0,
         scale_intensity: float = 0.2,
@@ -91,7 +92,7 @@ class FL_Audio_Reactive_Scale:
 
         Args:
             frames: Input frames tensor (batch, height, width, channels)
-            envelope_json: JSON string with envelope data
+            envelope: Frame-aligned FL audio envelope
             mask: Optional mask to control where effect is applied
             base_scale: Base scale value (1.0 = normal)
             scale_intensity: How much envelope affects scale
@@ -110,12 +111,10 @@ class FL_Audio_Reactive_Scale:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size, height, width, channels = frames.shape
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL Audio Reactive Scale] Input frames: {batch_size}")
             print(f"[FL Audio Reactive Scale] Envelope frames: {num_envelope_frames}")
@@ -135,7 +134,7 @@ class FL_Audio_Reactive_Scale:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate scale for this frame
                 scale = base_scale + (envelope_value * scale_intensity)

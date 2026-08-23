@@ -238,10 +238,10 @@ class LoadVideoExecutionTests(unittest.TestCase):
                 result = load_video.FL_LoadVideo().load_video("nested/clip.mp4", json.dumps(configured))
 
         create_source.assert_called_once_with(str(path.resolve()), start_time=0, duration=4 / 30)
-        progress_type.assert_called_once_with(5)
+        progress_type.assert_called_once_with(100)
         self.assertEqual(
             [call.args[0] for call in progress_type.return_value.update_absolute.call_args_list],
-            [0, 1, 2, 3, 4, 5],
+            [10, 75, 85, 95, 100],
         )
         loaded_images, loaded_audio, returned_video, fps, frame_count = result["result"]
         self.assertEqual(loaded_images.shape, (2, 2, 2, 3))
@@ -315,6 +315,18 @@ class LoadVideoFrontendTests(unittest.TestCase):
             'LOAD_PROGRESS_PHASES',
             'beginTransientProgress("uploading")',
             'beginTransientProgress("probing")',
+            'beginTransientProgress("loading preview")',
+            "new XMLHttpRequest()",
+            'request.upload.addEventListener("progress"',
+            'api.apiURL("/upload/image")',
+            'this.video.addEventListener("loadstart"',
+            'this.video.addEventListener("stalled"',
+            'this.video.addEventListener("abort"',
+            'this.progress.setAttribute("aria-valuetext", label)',
+            'this.progress.removeAttribute("aria-valuenow")',
+            'this.preview.setAttribute("aria-busy"',
+            "progressPhase(LOAD_PROGRESS_PHASES",
+            "request.abort()",
             'api.addEventListener("progress"',
             'api.addEventListener("execution_cached"',
             'api.addEventListener("execution_interrupted"',
