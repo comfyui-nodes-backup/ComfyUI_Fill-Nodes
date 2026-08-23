@@ -2,11 +2,12 @@ import glfw
 import ctypes
 import torch
 import numpy as np
-import json
 from PIL import Image
 import OpenGL.GL as gl
 
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 VERTEX_SHADER = """
 #version 330 core
@@ -172,7 +173,7 @@ class FL_PaperDrawn:
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {"default": "", "description": "Optional: Envelope JSON for audio-reactive blending"}),
+                "envelope": ("FL_AUDIO_ENVELOPE", {"description": "Optional FL audio envelope for reactive blending"}),
                 "blend_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "description": "Audio-reactive blend intensity"}),
                 "invert": ("BOOLEAN", {"default": False, "description": "Invert envelope (show sketch when quiet)"}),
                 "mask": ("IMAGE", {"default": None, "description": "Optional mask to control where effect is applied"}),
@@ -189,12 +190,12 @@ class FL_PaperDrawn:
     FUNCTION = "apply_shader"
     CATEGORY = "🏵️Fill Nodes/VFX"
 
-    def apply_shader(self, image, angle_num=3.0, samp_num=2.2, line_width=1.0, vignette=0.0, fps=30, envelope_json="", blend_intensity=1.0, invert=False, mask=None):
+    def apply_shader(self, image, angle_num=3.0, samp_num=2.2, line_width=1.0, vignette=0.0, fps=30, envelope=None, blend_intensity=1.0, invert=False, mask=None):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(image, angle_num, samp_num, line_width, vignette, fps, envelope_json, blend_intensity, invert, mask)
+            return self._apply_audio_reactive(image, angle_num, samp_num, line_width, vignette, fps, envelope, blend_intensity, invert, mask)
         else:
             return self._apply_static(image, angle_num, samp_num, line_width, vignette, fps, mask)
 
@@ -234,7 +235,7 @@ class FL_PaperDrawn:
 
         return (torch.cat(result, dim=0),)
 
-    def _apply_audio_reactive(self, image, angle_num, samp_num, line_width, vignette, fps, envelope_json, blend_intensity, invert, mask=None):
+    def _apply_audio_reactive(self, image, angle_num, samp_num, line_width, vignette, fps, envelope, blend_intensity, invert, mask=None):
         """Audio-reactive blending between original and paper drawn effect"""
         print(f"\n{'='*60}")
         print(f"[FL Paper Drawn] Audio-reactive mode enabled")
@@ -243,12 +244,10 @@ class FL_PaperDrawn:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = len(image)
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL Paper Drawn] Input frames: {batch_size}")
             print(f"[FL Paper Drawn] Envelope frames: {num_envelope_frames}")
@@ -317,7 +316,7 @@ class FL_PaperDrawn:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Invert if requested
                 if invert:

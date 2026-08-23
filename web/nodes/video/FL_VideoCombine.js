@@ -20,6 +20,87 @@ const DEFAULT_SETTINGS = {
 const MIN_NODE_WIDTH = 420;
 const MIN_NODE_HEIGHT = 360;
 const MIN_PANEL_HEIGHT = 280;
+const COMBINE_PROGRESS_PHASES = [
+  { value: 0, label: "preparing" },
+  { value: 10, label: "encoding MP4" },
+  { value: 95, label: "finalizing" },
+];
+const videoCombinePanels = new Set();
+const videoCombinePanelsByNode = new Map();
+const synchronizedPanels = new Set();
+let synchronizationFrame = null;
+
+function nodeKey(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function eventNode(detail) {
+  if (detail && typeof detail === "object") return detail.node ?? detail.node_id;
+  return detail;
+}
+
+function progressPhase(phases, value) {
+  let phase = phases[0];
+  for (const candidate of phases) {
+    if (value < candidate.value) break;
+    phase = candidate;
+  }
+  return phase.label;
+}
+
+function stopSynchronization() {
+  if (synchronizationFrame !== null) {
+    cancelAnimationFrame(synchronizationFrame);
+    synchronizationFrame = null;
+  }
+  synchronizedPanels.clear();
+}
+
+function removeSynchronizedPanel(panel) {
+  synchronizedPanels.delete(panel);
+  if (synchronizedPanels.size < 2 && synchronizationFrame !== null) {
+    cancelAnimationFrame(synchronizationFrame);
+    synchronizationFrame = null;
+  }
+}
+
+function maintainSynchronization() {
+  synchronizationFrame = null;
+  const panels = [...synchronizedPanels].filter((panel) => panel.isPlaying());
+  for (const panel of synchronizedPanels) {
+    if (!panels.includes(panel)) synchronizedPanels.delete(panel);
+  }
+  if (panels.length < 2 || document.hidden) return;
+
+  const leaderTime = panels[0].video.currentTime;
+  for (const panel of panels.slice(1)) {
+    const video = panel.video;
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) continue;
+    if (Number.isFinite(video.duration) && leaderTime >= video.duration) continue;
+    if (Math.abs(video.currentTime - leaderTime) > 0.08) {
+      video.currentTime = leaderTime;
+    }
+  }
+  synchronizationFrame = requestAnimationFrame(maintainSynchronization);
+}
+
+function synchronizeVideoCombinePreviews() {
+  const panels = [...videoCombinePanels].filter((panel) => panel.hasPreview());
+  if (!panels.length) return;
+
+  stopSynchronization();
+  for (const panel of panels) panel.prepareForSynchronization();
+  for (const panel of panels) synchronizedPanels.add(panel);
+  for (const panel of panels) panel.requestPlayback(true);
+  if (panels.length > 1) {
+    synchronizationFrame = requestAnimationFrame(maintainSynchronization);
+  }
+}
+
+function pauseAllVideoCombinePreviews() {
+  stopSynchronization();
+  for (const panel of videoCombinePanels) panel.pausePlayback(false);
+}
 
 const STYLES = `
   .flvc-panel {
@@ -128,7 +209,6 @@ const STYLES = `
   .flvc-toggle[data-enabled="true"] .flvc-toggle-value { color: #86efac; }
   .flvc-more-button,
   .flvc-icon-button,
-  .flvc-sync-button,
   .flvc-menu-close,
   .flvc-reset-button {
     background: var(--flvc-control);
@@ -146,7 +226,6 @@ const STYLES = `
   }
   .flvc-more-button:hover,
   .flvc-icon-button:hover,
-  .flvc-sync-button:hover,
   .flvc-menu-close:hover,
   .flvc-reset-button:hover {
     border-color: var(--flvc-accent);
@@ -157,7 +236,6 @@ const STYLES = `
   }
   .flvc-more-button:focus-visible,
   .flvc-icon-button:focus-visible,
-  .flvc-sync-button:focus-visible,
   .flvc-menu-close:focus-visible,
   .flvc-reset-button:focus-visible {
     outline: 2px solid var(--flvc-accent);
@@ -220,7 +298,52 @@ const STYLES = `
   }
   .flvc-status[data-state="ready"] { background: rgba(18, 59, 43, .9); color: #86efac; }
   .flvc-status[data-state="stale"] { background: rgba(70, 55, 24, .9); color: #fde68a; }
+  .flvc-status[data-state="busy"] { background: rgba(49, 46, 129, .9); color: #c4b5fd; }
   .flvc-status[data-state="error"] { background: rgba(76, 29, 36, .9); color: #fda4af; }
+  .flvc-progress {
+    background: rgba(23, 24, 29, .9);
+    border: 1px solid rgba(255, 255, 255, .09);
+    border-radius: 999px;
+    bottom: 38px;
+    height: 7px;
+    left: 7px;
+    overflow: hidden;
+    position: absolute;
+    right: 7px;
+    z-index: 4;
+  }
+  .flvc-progress[hidden] { display: none; }
+  .flvc-progress-fill {
+    background: linear-gradient(90deg, #7c3aed, #a78bfa);
+    display: block;
+    height: 100%;
+    overflow: hidden;
+    position: relative;
+    transition: width 160ms ease;
+    width: 0;
+  }
+  .flvc-progress[data-state="active"] .flvc-progress-fill::after {
+    animation: flvc-progress-sheen 1s linear infinite;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .5), transparent);
+    content: "";
+    inset: 0;
+    position: absolute;
+    transform: translateX(-100%);
+  }
+  .flvc-progress[data-indeterminate="true"] .flvc-progress-fill {
+    animation: flvc-progress-slide 1s ease-in-out infinite alternate;
+    transition: none;
+    width: 42% !important;
+  }
+  .flvc-progress[data-state="complete"] .flvc-progress-fill { background: #22c55e; }
+  .flvc-progress[data-state="error"] .flvc-progress-fill { background: #ef4444; }
+  @keyframes flvc-progress-sheen {
+    to { transform: translateX(100%); }
+  }
+  @keyframes flvc-progress-slide {
+    from { transform: translateX(-20%); }
+    to { transform: translateX(140%); }
+  }
   .flvc-preview-controls {
     align-items: center;
     background: linear-gradient(transparent, rgba(0, 0, 0, .82) 55%);
@@ -241,12 +364,9 @@ const STYLES = `
     padding: 0;
   }
   .flvc-sync-button {
-    border-radius: 4px;
-    flex: 0 0 38px;
+    flex-basis: 40px;
     font-size: 9px;
     font-weight: 700;
-    height: 25px;
-    padding: 0 5px;
   }
   .flvc-time {
     color: #e4e4e7;
@@ -410,72 +530,6 @@ function formatTime(value) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-const synchronizedPanels = new Set();
-let synchronizationFrame = null;
-
-function getVideoCombinePanels() {
-  return (app.graph?._nodes || [])
-    .filter((node) => node.comfyClass === "FL_VideoCombine")
-    .map((node) => node._flVideoCombinePanel)
-    .filter(Boolean);
-}
-
-function stopSynchronization() {
-  if (synchronizationFrame !== null) {
-    cancelAnimationFrame(synchronizationFrame);
-    synchronizationFrame = null;
-  }
-  synchronizedPanels.clear();
-}
-
-function removeSynchronizedPanel(panel) {
-  synchronizedPanels.delete(panel);
-  if (synchronizedPanels.size < 2 && synchronizationFrame !== null) {
-    cancelAnimationFrame(synchronizationFrame);
-    synchronizationFrame = null;
-  }
-}
-
-function maintainSynchronization() {
-  synchronizationFrame = null;
-  for (const panel of synchronizedPanels) {
-    if (!panel.isSynchronizationActive()) synchronizedPanels.delete(panel);
-  }
-  const panels = [...synchronizedPanels];
-  if (panels.length < 2 || document.hidden) return;
-
-  const leader = panels[0].video;
-  if (!leader.paused && leader.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-    for (const panel of panels.slice(1)) {
-      const video = panel.video;
-      if (video.paused || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) continue;
-      if (Number.isFinite(video.duration) && leader.currentTime >= video.duration) continue;
-      if (Math.abs(video.currentTime - leader.currentTime) > 0.08) {
-        video.currentTime = leader.currentTime;
-      }
-    }
-  }
-  synchronizationFrame = requestAnimationFrame(maintainSynchronization);
-}
-
-function syncVideoCombinePreviews() {
-  const panels = getVideoCombinePanels().filter((panel) => panel.hasPreview());
-  if (!panels.length) return;
-
-  stopSynchronization();
-  for (const panel of panels) panel.prepareForSynchronization();
-  for (const panel of panels) synchronizedPanels.add(panel);
-  for (const panel of panels) panel.requestPlayback(true);
-  if (panels.length > 1) {
-    synchronizationFrame = requestAnimationFrame(maintainSynchronization);
-  }
-}
-
-function pauseAllVideoCombinePreviews() {
-  stopSynchronization();
-  for (const panel of getVideoCombinePanels()) panel.pausePlayback(false);
-}
-
 class VideoCombinePanel {
   constructor(node, settingsWidget, container) {
     this.node = node;
@@ -488,6 +542,11 @@ class VideoCombinePanel {
     this.handleDocumentKeyDown = null;
     this.playbackRequested = false;
     this.restartAtStart = false;
+    this.executionActive = false;
+    this.progressToken = 0;
+    this.progressHideTimer = null;
+    this.previewLoadToken = null;
+    this.previewLoading = false;
 
     this.node.properties ||= {};
     if (!Number.isFinite(this.node.properties.previewVolume)) {
@@ -508,6 +567,7 @@ class VideoCombinePanel {
     if (this.configError) {
       this.showConfigError();
     }
+    videoCombinePanels.add(this);
   }
 
   readSettings() {
@@ -572,14 +632,17 @@ class VideoCombinePanel {
           <div class="flvc-placeholder" data-role="placeholder">Queue the workflow to render a preview.</div>
           <div class="flvc-summary" data-role="summary">MP4 · H.264</div>
           <div class="flvc-status" data-role="status" data-state="idle">not rendered</div>
+          <div class="flvc-progress" data-role="progress" data-state="active" data-indeterminate="false" role="progressbar" hidden>
+            <span class="flvc-progress-fill" data-role="progress-fill"></span>
+          </div>
           <div class="flvc-preview-controls">
             <button class="flvc-icon-button" data-role="play" type="button" title="Play or pause preview">▶</button>
             <span class="flvc-time" data-role="time">00:00 / 00:00</span>
             <span class="flvc-control-spacer"></span>
+            <button class="flvc-icon-button flvc-sync-button" data-role="sync" type="button" title="Restart and synchronize all FL Video Combine previews">Sync</button>
             <button class="flvc-icon-button" data-role="preview-mute" type="button" title="Mute preview">🔇</button>
             <input class="flvc-preview-volume" data-role="preview-volume" aria-label="Preview volume" type="range" min="0" max="100" step="1">
             <span class="flvc-preview-value" data-role="preview-volume-value">80%</span>
-            <button class="flvc-sync-button" data-role="sync" type="button" title="Restart all FL Video Combine previews together">Sync</button>
           </div>
         </div>
 
@@ -620,16 +683,19 @@ class VideoCombinePanel {
       </div>
     `;
 
+    this.previewRegion = this.container.querySelector(".flvc-preview");
     this.video = this.container.querySelector('[data-role="video"]');
     this.placeholder = this.container.querySelector('[data-role="placeholder"]');
     this.status = this.container.querySelector('[data-role="status"]');
     this.error = this.container.querySelector('[data-role="error"]');
     this.summary = this.container.querySelector('[data-role="summary"]');
+    this.progress = this.container.querySelector('[data-role="progress"]');
+    this.progressFill = this.container.querySelector('[data-role="progress-fill"]');
     this.playButton = this.container.querySelector('[data-role="play"]');
+    this.syncButton = this.container.querySelector('[data-role="sync"]');
     this.previewMuteButton = this.container.querySelector('[data-role="preview-mute"]');
     this.previewVolume = this.container.querySelector('[data-role="preview-volume"]');
     this.previewVolumeValue = this.container.querySelector('[data-role="preview-volume-value"]');
-    this.syncButton = this.container.querySelector('[data-role="sync"]');
     this.time = this.container.querySelector('[data-role="time"]');
     this.audioToggle = this.container.querySelector('[data-role="audio-toggle"]');
     this.audioToggleValue = this.container.querySelector('[data-role="audio-toggle-value"]');
@@ -695,6 +761,7 @@ class VideoCombinePanel {
         this.pausePlayback();
       }
     });
+    this.syncButton.addEventListener("click", synchronizeVideoCombinePreviews);
     this.video.addEventListener("play", () => {
       if (!this.playbackRequested || document.hidden) {
         this.pausePlayback();
@@ -706,18 +773,38 @@ class VideoCombinePanel {
       this.playButton.textContent = "▶";
     });
     this.video.addEventListener("timeupdate", () => this.updateTime());
+    this.video.addEventListener("loadstart", () => {
+      if (!this.video.src) return;
+      this.previewLoading = true;
+      if (!this.executionActive && this.previewLoadToken !== this.progressToken) {
+        this.previewLoadToken = this.beginTransientProgress("loading preview");
+      }
+    });
     this.video.addEventListener("loadedmetadata", () => {
+      this.previewLoading = false;
       if (this.restartAtStart) {
         this.video.currentTime = 0;
         this.restartAtStart = false;
       }
       this.placeholder.style.display = "none";
       this.updateTime();
+      this.finishTransientProgress(this.previewLoadToken, "ready");
     });
     this.video.addEventListener("error", () => {
       if (!this.video.src) return;
+      this.previewLoading = false;
       this.placeholder.textContent = "Preview unavailable. The rendered file may still be valid.";
       this.placeholder.style.display = "flex";
+      this.failTransientProgress(this.previewLoadToken, "preview failed");
+    });
+    this.video.addEventListener("stalled", () => {
+      if (!this.previewLoading || this.executionActive) return;
+      this.showProgress(0, 1, "loading preview", "active", true);
+    });
+    this.video.addEventListener("abort", () => {
+      if (this.video.src) return;
+      this.previewLoading = false;
+      if (!this.executionActive) this.hideProgress();
     });
 
     this.previewMuteButton.addEventListener("click", () => {
@@ -728,15 +815,14 @@ class VideoCombinePanel {
       this.node.properties.previewVolume = Number(this.previewVolume.value) / 100;
       this.applyPreviewAudio();
     });
-    this.syncButton.addEventListener("click", syncVideoCombinePreviews);
   }
 
   hasPreview() {
     return Boolean(this.preview && this.video.src);
   }
 
-  isSynchronizationActive() {
-    return this.playbackRequested && !this.video.ended;
+  isPlaying() {
+    return this.playbackRequested && !this.video.paused && !this.video.ended;
   }
 
   requestPlayback(keepSynchronized = false) {
@@ -854,6 +940,96 @@ class VideoCombinePanel {
     this.status.textContent = label;
   }
 
+  showProgress(value, max, label, state = "active", indeterminate = false) {
+    if (this.progressHideTimer !== null) {
+      clearTimeout(this.progressHideTimer);
+      this.progressHideTimer = null;
+    }
+    const total = Math.max(1, Number(max) || 1);
+    const current = Math.max(0, Math.min(total, Number(value) || 0));
+    this.progress.hidden = false;
+    this.progress.dataset.state = state;
+    this.progress.dataset.indeterminate = String(indeterminate);
+    this.progress.setAttribute("aria-valuemin", "0");
+    this.progress.setAttribute("aria-valuemax", String(total));
+    this.progress.setAttribute("aria-valuetext", label);
+    if (indeterminate) this.progress.removeAttribute("aria-valuenow");
+    else this.progress.setAttribute("aria-valuenow", String(current));
+    this.progressFill.style.width = `${current / total * 100}%`;
+    this.previewRegion.setAttribute("aria-busy", String(state === "active"));
+    if (state === "error") this.setStatus("error", label);
+    else if (state === "complete") this.setStatus("ready", label);
+    else this.setStatus("busy", label);
+  }
+
+  hideProgress() {
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
+    this.progressHideTimer = null;
+    this.progress.hidden = true;
+    this.progressFill.style.width = "0%";
+    this.previewRegion.setAttribute("aria-busy", "false");
+  }
+
+  scheduleProgressHide() {
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
+    this.progressHideTimer = window.setTimeout(() => {
+      this.progress.hidden = true;
+      this.progressHideTimer = null;
+    }, 900);
+  }
+
+  beginTransientProgress(label) {
+    const token = ++this.progressToken;
+    if (!this.executionActive) this.showProgress(0, 1, label, "active", true);
+    return token;
+  }
+
+  finishTransientProgress(token, label = "ready") {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(1, 1, label, "complete");
+    this.scheduleProgressHide();
+  }
+
+  failTransientProgress(token, label) {
+    if (this.executionActive || token !== this.progressToken) return;
+    this.showProgress(1, 1, label, "error");
+  }
+
+  beginExecution() {
+    this.progressToken += 1;
+    this.executionActive = true;
+    this.showProgress(0, 100, COMBINE_PROGRESS_PHASES[0].label, "active", true);
+  }
+
+  updateExecutionProgress(value, max) {
+    this.executionActive = true;
+    const total = Math.max(1, Number(max) || 100);
+    const current = Math.max(0, Math.min(total, Number(value) || 0));
+    if (current >= total) {
+      this.finishExecution("rendered");
+      return;
+    }
+    const label = progressPhase(COMBINE_PROGRESS_PHASES, current / total * 100);
+    this.showProgress(current, total, label, "active");
+  }
+
+  finishExecution(label) {
+    this.executionActive = false;
+    this.progressToken += 1;
+    this.showProgress(1, 1, label, "complete");
+    this.scheduleProgressHide();
+  }
+
+  failProgress(label) {
+    this.executionActive = false;
+    this.progressToken += 1;
+    this.showProgress(1, 1, label, "error");
+  }
+
+  markCached() {
+    this.finishExecution("cached");
+  }
+
   loadPreview(preview) {
     if (!preview?.filename) return;
     this.pausePlayback();
@@ -871,10 +1047,11 @@ class VideoCombinePanel {
       });
       this.video.src = api.apiURL(`/view?${params.toString()}`);
     }
-    this.video.load();
     this.placeholder.textContent = "Loading preview…";
     this.placeholder.style.display = "flex";
-    this.setStatus("ready", "ready");
+    this.previewLoading = true;
+    this.previewLoadToken = this.beginTransientProgress("loading preview");
+    this.video.load();
 
     const padded = preview.source_width !== preview.encoded_width || preview.source_height !== preview.encoded_height;
     const dimensions = padded
@@ -890,6 +1067,7 @@ class VideoCombinePanel {
     if (!preview) return;
     this.node.properties.lastPreview = { ...preview };
     this.node.properties.lastRenderSettings = this.settingsWidget.value;
+    this.finishExecution("rendered");
     this.loadPreview(preview);
   }
 
@@ -910,7 +1088,10 @@ class VideoCombinePanel {
   }
 
   dispose() {
+    videoCombinePanels.delete(this);
+    videoCombinePanelsByNode.delete(nodeKey(this.node.id));
     removeSynchronizedPanel(this);
+    if (this.progressHideTimer !== null) clearTimeout(this.progressHideTimer);
     if (this.handleDocumentPointerDown) {
       document.removeEventListener("pointerdown", this.handleDocumentPointerDown);
     }
@@ -920,9 +1101,6 @@ class VideoCombinePanel {
     this.pausePlayback(false);
     this.video.removeAttribute("src");
     this.video.load();
-    if (this.node._flVideoCombinePanel === this) {
-      delete this.node._flVideoCombinePanel;
-    }
     this.container.replaceChildren();
   }
 }
@@ -957,7 +1135,7 @@ app.registerExtension({
     requestAnimationFrame(() => enforceMinimumNodeSize(node));
 
     const panel = new VideoCombinePanel(node, settingsWidget, container);
-    node._flVideoCombinePanel = panel;
+    videoCombinePanelsByNode.set(nodeKey(node.id), panel);
 
     const originalOnExecuted = node.onExecuted;
     node.onExecuted = function (message) {
@@ -969,10 +1147,36 @@ app.registerExtension({
     node.onConfigure = function (...args) {
       const result = originalOnConfigure?.apply(this, args);
       panel.configure();
+      videoCombinePanelsByNode.set(nodeKey(this.id), panel);
       requestAnimationFrame(() => enforceMinimumNodeSize(this));
       return result;
     };
 
     domWidget.onRemove = () => panel.dispose();
   },
+});
+
+api.addEventListener("executing", (event) => {
+  videoCombinePanelsByNode.get(nodeKey(eventNode(event.detail)))?.beginExecution();
+});
+
+api.addEventListener("progress", (event) => {
+  const detail = event.detail || {};
+  videoCombinePanelsByNode.get(nodeKey(detail.node))?.updateExecutionProgress(detail.value, detail.max);
+});
+
+api.addEventListener("execution_cached", (event) => {
+  const nodes = Array.isArray(event.detail?.nodes) ? event.detail.nodes : [];
+  for (const nodeId of nodes) videoCombinePanelsByNode.get(nodeKey(nodeId))?.markCached();
+});
+
+api.addEventListener("execution_error", (event) => {
+  const detail = event.detail || {};
+  videoCombinePanelsByNode.get(nodeKey(eventNode(detail)))?.failProgress("encode failed");
+});
+
+api.addEventListener("execution_interrupted", () => {
+  for (const panel of videoCombinePanelsByNode.values()) {
+    if (panel.executionActive) panel.failProgress("interrupted");
+  }
 });

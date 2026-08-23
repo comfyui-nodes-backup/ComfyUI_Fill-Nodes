@@ -293,20 +293,23 @@ Fill-Nodes is a versatile collection of custom nodes for ComfyUI that extends fu
 | `FL_Fal_Pixverse` | Generates videos from single image using Fal AI Pixverse v5 Image-to-Video API with style presets, camera movements, and parallel batch processing (up to 5). Returns extracted frames from generated videos as tensors. |
 | `FL_Fal_Pixverse_LipSync` | Generates lip-sync videos using Fal AI Pixverse LipSync API supporting both audio input and text-to-speech modes with voice selection, processing video frames tensor with audio synchronization. Returns lip-synced video frames and audio. |
 | `FL_Fal_Pixverse_Transition` | Creates transition videos between two images using Fal AI Pixverse v5 Transition API with configurable resolution, aspect ratio, and duration. Returns extracted frames from generated transition videos. |
+| `FL_Fal_Seedance2_ReferenceToVideo` | Generates native ComfyUI VIDEO output through Fal's `bytedance/seedance-2.0/reference-to-video` endpoint. Supports prompt-only generation or Autogrow groups of up to 9 images, 3 videos, and 3 audio clips, with clickable `@Image1`, `@Video1`, and `@Audio1` prompt tags plus an on-node queue and result dashboard. |
 | `FL_Fal_Seedance_i2v` | Generates videos from single image using Fal AI ByteDance Seedance v1 Pro Image-to-Video API with support for multi-segment prompts using [cut] markers, configurable resolution, duration, and camera settings. Returns all extracted frames from generated video. |
 | `FL_Fal_Seedream_Edit` | Edits up to 10 images using Fal AI ByteDance Seedream v4 Edit API with custom or preset image sizes, auto-scaling to meet minimum dimensions while preserving aspect ratio. Returns edited images with URLs and seed information. |
 | `FL_Fal_SeedVR_Upscale` | Upscales a single image via Fal AI's SeedVR endpoint with a configurable upscale factor (1.0×–10.0×) and seed. Uploads the tensor to fal.media, polls for completion, and returns the upscaled image plus its URL and final dimensions. |
 | `FL_Fal_Sora` | Generates videos using Fal AI Sora 2 API supporting both text-to-video and image-to-video modes with optional OpenAI API key pass-through, automatic endpoint selection based on PRO mode, and audio extraction. Returns video frames, audio waveform, video URL, and status message. |
-| `FL_GeminiImageEditor` | Generates or edits images using Google Gemini 2.5 Flash Image API with support for up to 4 reference images, batch generation with parallel async processing, and optional square padding. Returns list of generated images with detailed API response logs. |
+| `FL_GeminiImageEditor` | Generates or edits images using Google Gemini image models with support for up to 4 reference images, batch generation with parallel async processing, and optional square padding. Returns list of generated images with detailed API response logs. |
 | `FL_GeminiImageGenADV` | Advanced multi-input image generation using Google Gemini with dynamic input count (1-100), async parallel batch processing, and per-input prompt/image pairs. Returns list of generated images based on variable number of input slots. |
-| `FL_GeminiTextAPI` | Generates text responses using Google Gemini models (2.5/2.0/1.5 variants) with configurable temperature, token limits, and optional system instructions. Returns raw text output without additional formatting. |
-| `FL_GeminiVideoCaptioner` | Generates detailed captions for videos or image sequences using Google Gemini API, with automatic WebM conversion for API compatibility, frame extraction at configurable FPS, and support for audio processing. Returns caption text and sample frame from video. |
+| `FL_GeminiTextAPI` | Generates text responses using current Gemini language models through the Interactions API, with configurable output limits, system instructions, and optional model override. |
+| `FL_GeminiVideoCaptioner` | Generates detailed captions for videos or image sequences using current Gemini multimodal models, with Files API upload for video inputs and a sampled-frame output. |
 | `FL_Hedra_API` | Generates videos from image, audio file, and text prompt using Hedra API with configurable aspect ratio and resolution, automatic polling for generation completion, and frame extraction from downloaded video. Returns video frames tensor with processing logs. |
 | `FL_PixVerseAPI` | Generates videos from images using PixVerse API with support for standard image-to-video and transition modes, parallel batch processing with configurable seeds, and automatic frame extraction from generated MP4 videos. Returns up to 5 batches of extracted frames as tensors. |
 | `FL_RunwayAct2` | Generates character performance videos using RunwayML Act Two API from input character images/videos and reference videos, with controls for body movement and expression intensity. Returns extracted video frames as tensors. |
 | `FL_RunwayImageAPI` | Generates images using RunwayML Gen4 Image API with support for up to 3 reference images with custom tags, configurable generation parameters, and automatic polling for task completion. Returns generated image tensor and detailed status logs. |
 | `FL_Veo3VideoGen` | Generates videos using Google Vertex AI Veo 3.0 models with service account authentication, optional reference image input, configurable aspect ratio/resolution, and automatic polling with frame extraction. Returns extracted video frames, video path, and processing logs. |
 | `FL_VertexGemini25FlashImage` | Generates images using Google Vertex AI Gemini 2.5 Flash Image model with service account authentication, support for up to 3 reference images, and parallel batch generation. Returns batch tensor of generated images with detailed processing logs. |
+
+For `FL_Fal_Seedance2_ReferenceToVideo`, set `FAL_KEY` in the ComfyUI environment or use the advanced `fal_api_key` override. Connected references are uploaded in numbered socket order; reference audio requires at least one image or video. The node returns the generated native `VIDEO`, remote URL, Fal-provided seed, and request ID.
 
 ### 📷 Screenshots & Examples
 
@@ -324,10 +327,13 @@ Fill-Nodes is a versatile collection of custom nodes for ComfyUI that extends fu
 | Node | Description |
 |------|-------------|
 | `FL_Audio_BPM_Analyzer` | Analyzes audio using librosa to detect BPM and beat positions, with options for two BPM calculation methods (beat_intervals or onset_strength), beat offset adjustment, and automatic beat filling to cover the entire audio duration. Outputs beat positions as JSON with visualization. |
+| `FL_Audio_Beat_Prompt_Envelope` | Turns exact detected beats into attack/hold/release prompt-mask pulses for compatible FL diffusion video nodes. Supports beat stride, phase, response curve, and on-beat dominance above normal conditioning weight. |
+| `FL_Audio_Beat_Prompt_Schedule` | Compact node with a full-screen audio/prompt sequencer, Beat This analysis, waveform-aligned trimming, frame-native prompt clips, local Whisper transcription or LRC/SRT import, an editable timed-lyrics lane, Beat Writer lyric context, and three live reactive-envelope editors. Outputs the schedule, frame count, cropped audio, BPM, three typed audio envelopes, and one prompt-envelope set. |
 | `FL_Audio_Beat_Visualizer` | Generates video frames that visualize beat patterns by either alternating between black/white on beat changes or cycling through provided images, with configurable frame dimensions and starting color. |
 | `FL_AudioFrameCalculator` | Given an AUDIO and a target FPS, returns the integer frame count needed to cover the audio's duration (`ceil(duration * fps)`). Useful upstream of video-generation nodes that need an exact frame budget. |
 | `FL_Audio_Crop` | Crops audio waveforms to specified start and end times using MM:SS or seconds format, with automatic clamping to valid audio boundaries. |
 | `FL_Audio_Drum_Detector` | Detects kicks, snares, and hi-hats from audio using librosa onset detection with frequency band analysis (kicks: 30-300Hz, snares: 150-400Hz + 4-10kHz noise, hi-hats: 6kHz+) and adjustable sensitivity thresholds. |
+| `FL_Audio_Envelope_Prompt` | Maps an existing FL audio envelope to diffusion prompt-mask strength, with threshold, response curve, inversion, and floor/peak controls. |
 | `FL_Audio_Envelope_Visualizer` | Visualizes audio envelopes as grayscale video frames where pixel intensity corresponds to envelope values, with configurable intensity multiplier and optional color inversion. |
 | `FL_Audio_Music_Video_Sequencer` | Generates complete music video shot sequences from beat positions using pattern-based orchestration (A/B/C/D patterns with configurable beat counts), creating drift-free frame boundaries and detailed metadata for each shot including time, beat, and sample boundaries. |
 | `FL_Audio_Reactive_Brightness` | Multiplies frame pixel values by brightness factors calculated from audio envelopes, with configurable base brightness, intensity scaling, optional inversion, and output clamping. |
@@ -376,6 +382,34 @@ Fill-Nodes is a versatile collection of custom nodes for ComfyUI that extends fu
 | `FL_PromptMulti` | Processes multi-line positive and negative prompts into parallel lists, automatically balancing counts by repeating the last prompt or using empty strings. Generates indexed names with configurable prefix and outputs as lists for batch processing. |
 | `FL_PromptSelector` | Selects a single prompt line by index from a multi-line prompt string, optionally prepending and appending text with automatic space insertion. |
 | `FL_PromptSelectorBasic` | Selects a single line from a multi-line prompt string by index, wrapping the index with modulo so it always loops within bounds. No prepend/append. |
+
+MiniMax H3 timeline, beat-planning, sampling, upscale, and shot-assembly nodes now live in the dedicated [ComfyUI-FL-MiniMaxH3](https://github.com/filliptm/ComfyUI-FL-MiniMaxH3) pack. Their node IDs are unchanged, so existing workflows continue to load after installing the new pack.
+
+For audio-reactive timing, choose or upload audio directly on `FL_Audio_Beat_Prompt_Schedule`, then connect its `prompt_schedule`, `audio`, and `prompt_envelopes` outputs to **FL MiniMax H3 Beat Shot Planner** from the dedicated pack. The three `FL_AUDIO_ENVELOPE` outputs can independently drive the visualizer, image-space effects, and VFX nodes. A connected `beat_positions` input remains an optional timing override for existing workflows:
+
+```text
+[0 - 48 | fade_in=6 | fade_out=6]
+The subject slowly turns toward camera.
+
+[48 - 96 | fade_out=6 | crossfade=12]
+The camera pushes forward on the beat.
+```
+
+Frame ranges are zero-based and range ends are exclusive. `fade_in` and `fade_out` blend a scheduled prompt with the global prompt. `crossfade` belongs to the incoming prompt and blends it directly with a touching previous prompt; the two scheduled weights retain full conditioning coverage throughout the transition. Detected beats appear in their own marker lane and can be used as the editor's snap target without changing the stored frame timing. A connected prompt schedule overrides the manual timeline. Exact repeated prompts share one conditioning mask, so reuse prompts for recurring sections such as choruses.
+
+The prompt schedule node loads its waveform as soon as an audio file is selected; queueing is not required. Use the source overview handles to trim, Play for continuous crop-aligned looping, Pause/Stop for transport control, and the main frame ruler to drag or resize prompt clips. The transport volume control is remembered per sequencer node and changes only browser preview loudness, never the audio output. Drag the shared center boundary between touching prompts to expand one while shortening the other; the pair stays contiguous and the boundary snaps to the beat grid. Right-click a beat-aligned position on the main timeline to set the audio In or Out point; prompt clips and envelopes are cropped and rebased with the audio so they stay aligned to the same musical moments. The Beat offset slider moves the working beat grid and beat-derived envelopes while the waveform, raw detections, transients, drums, and audio remain fixed. Analysis covers and caches the full source by its content hash and detector settings; crop, FPS, length, envelope, and offset edits reuse that analysis without rescanning.
+
+Beat and downbeat timing comes from the open-source MIT-licensed [`beat-this==1.1.0`](https://github.com/CPJKU/beat_this) package and its `final0` checkpoint. The first analysis explicitly downloads the 77.3 MiB checkpoint to `ComfyUI/models/beat_this/beat_this-final0.ckpt`; the sequencer shows download, verification, load, and analysis state. The artifact is SHA-256 verified before use, never downloads in the background, and is released from GPU memory after each analysis. Beat This analyzes the full master mix it was trained for; the Analysis source selector affects only Librosa onset and drum-family reference markers. Cyan circles are the offset-adjustable beat grid, gold diamonds and alternating shading are downbeats/bar starts, short magenta ticks are raw model beats, short orange ticks are transient onsets, and rose ticks identify intervals more than 25% from the median. Connecting `beat_positions` remains authoritative and skips Beat This during queued node execution.
+
+`Separate stems` is an explicit action and never runs automatically. It separates the full source once with Hybrid Demucs, caches bass/drums/other/vocals locally, switches analysis to the drums stem, and keeps the node's audio output on the original master crop. Jobs report progress, can be cancelled between chunks, and reuse valid cached stems.
+
+`Transcribe lyrics` runs Whisper locally against the cached vocals stem when available, or the full mix otherwise. The selected pinned Whisper model downloads to `ComfyUI/models/whisper/` only when that button is clicked; transcripts are content-addressed and cached locally. The lyrics lane supports frame-level timing and text correction plus timed LRC/SRT import. When **Include timed lyrics in Beat Writer** is enabled, only the visible lyric text and timing are included as read-only writing context; audio is never sent to the Writer.
+
+The lower sequencer inspector contains three fixed reactive-envelope slots. Each slot selects the beat grid, downbeat, raw beat, transient, kick, snare, or hi-hat source and provides stride, phase, attack, hold, release, curve, prompt floor, and prompt peak controls. Grayscale strips and current-frame tiles preview the normalized signal live at the audio playhead. Empty prompt text leaves a signal-only envelope for image-space effects; nonempty prompts are collected into `FL_PROMPT_ENVELOPE_SET` for the Beat Shot Planner.
+
+All FL audio-reactive and VFX nodes use the dedicated `FL_AUDIO_ENVELOPE` socket instead of generic JSON strings. `FL_Audio_Reactive_Envelope` still provides independent kick, snare, and hi-hat ADSR sources, and `FL_Audio_Envelope_Prompt` remains available when a typed signal needs to become an individual prompt envelope outside the sequencer workflow.
+
+Strict scheduling evaluates H3 once per unique active prompt on every sampling step. Start with a few broad sections, and disable cross-step caching or model compilation while validating a masked workflow. The semantic output keeps normal single-prompt sampling cost.
 
 ### 📷 Screenshots & Examples
 
@@ -459,6 +493,7 @@ Fill-Nodes is a versatile collection of custom nodes for ComfyUI that extends fu
 
 | Node | Description |
 |------|-------------|
+The MiniMax Music 3 loaders now live in the dedicated `ComfyUI-FL-MiniMaxMusic3` pack. Their node IDs are unchanged, so existing workflows remain compatible when that pack is installed.
 | `FL_NodeLoader` | A pass-through node that accepts and returns a TRIGGER type, designed for node dependency management in workflows. |
 | `FL_NodePackLoader` | A pass-through node with IS_CHANGED set to float('NaN') to ensure it always processes when triggered, useful for forcing workflow execution. |
 | `FL_UpscaleModel` | Upscales images in configurable batches using loaded upscale models with precision control (auto/32/16/bfloat16), optional downscaling by factor, multiple rescale methods (nearest-exact, bilinear, area, bicubic, lanczos), and TQDM progress tracking. |

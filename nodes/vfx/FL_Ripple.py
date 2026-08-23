@@ -1,9 +1,10 @@
 import torch
 import numpy as np
-import json
 from PIL import Image
 import math
 from comfy.utils import ProgressBar
+
+from ..audio.audio_envelope import load_audio_envelope
 
 class FL_Ripple:
     def __init__(self):
@@ -17,9 +18,8 @@ class FL_Ripple:
             },
             "optional": {
                 # Audio reactivity (optional - at top for visibility)
-                "envelope_json": ("STRING", {
-                    "default": "",
-                    "description": "Optional: Envelope JSON for audio-reactive blending"
+                "envelope": ("FL_AUDIO_ENVELOPE", {
+                    "description": "Optional FL audio envelope for reactive blending"
                 }),
                 "blend_intensity": ("FLOAT", {
                     "default": 1.0,
@@ -76,12 +76,12 @@ class FL_Ripple:
         mask = mask.resize(target_size, Image.LANCZOS)
         return mask.convert('L') if mask.mode != 'L' else mask
 
-    def ripple(self, images, envelope_json="", blend_intensity=1.0, invert=False, mask=None, amplitude=10.0, frequency=20.0, phase=0.0, center_x=50.0, center_y=50.0, modulation=0.0):
+    def ripple(self, images, envelope=None, blend_intensity=1.0, invert=False, mask=None, amplitude=10.0, frequency=20.0, phase=0.0, center_x=50.0, center_y=50.0, modulation=0.0):
         # Check if audio-reactive mode is enabled
-        use_audio_reactive = envelope_json and envelope_json.strip() != ""
+        use_audio_reactive = envelope is not None
 
         if use_audio_reactive:
-            return self._apply_audio_reactive(images, envelope_json, blend_intensity, invert, mask, amplitude, frequency, phase, center_x, center_y, modulation)
+            return self._apply_audio_reactive(images, envelope, blend_intensity, invert, mask, amplitude, frequency, phase, center_x, center_y, modulation)
         else:
             return self._apply_static(images, mask, amplitude, frequency, phase, center_x, center_y, modulation)
 
@@ -144,7 +144,7 @@ class FL_Ripple:
         out = torch.cat(out, 0)
         return (out,)
 
-    def _apply_audio_reactive(self, images, envelope_json, blend_intensity, invert, mask, amplitude, frequency, phase, center_x, center_y, modulation):
+    def _apply_audio_reactive(self, images, envelope, blend_intensity, invert, mask, amplitude, frequency, phase, center_x, center_y, modulation):
         """Audio-reactive ripple effect with envelope-based blending"""
         print(f"\n{'='*60}")
         print(f"[FL_Ripple Audio Reactive] DEBUG: Function called")
@@ -154,12 +154,10 @@ class FL_Ripple:
         print(f"{'='*60}\n")
 
         try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+            envelope_values = load_audio_envelope(envelope)["values"]
 
             batch_size = len(images)
-            num_envelope_frames = len(envelope)
+            num_envelope_frames = len(envelope_values)
 
             print(f"[FL_Ripple Audio Reactive] Input frames: {batch_size}")
             print(f"[FL_Ripple Audio Reactive] Envelope frames: {num_envelope_frames}")
@@ -236,7 +234,7 @@ class FL_Ripple:
 
             for frame_idx in range(max_frames):
                 # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
+                envelope_value = envelope_values[frame_idx]
 
                 # Calculate blend amount
                 if invert:

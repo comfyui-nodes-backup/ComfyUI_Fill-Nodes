@@ -12,6 +12,7 @@ from .nodes.ai.FL_Fal_Kontext import FL_Fal_Kontext
 from .nodes.ai.FL_Fal_Pixverse import FL_Fal_Pixverse
 from .nodes.ai.FL_Fal_Pixverse_LipSync import FL_Fal_Pixverse_LipSync
 from .nodes.ai.FL_Fal_Pixverse_Transition import FL_Fal_Pixverse_Transition
+from .nodes.ai.FL_Fal_Seedance2_ReferenceToVideo import FL_Fal_Seedance2_ReferenceToVideo
 from .nodes.ai.FL_Fal_Seedance_i2v import FL_Fal_Seedance_i2v
 from .nodes.ai.FL_Fal_Seedream_Edit import FL_Fal_Seedream_Edit
 from .nodes.ai.FL_Fal_SeedVR_Upscale import FL_Fal_SeedVR_Upscale
@@ -41,6 +42,8 @@ from .nodes.api_tools.FL_API_ImageSaver import FL_API_ImageSaver
 
 # AUDIO NODES
 from .nodes.audio.FL_Audio_BPM_Analyzer import FL_Audio_BPM_Analyzer
+from .nodes.audio.FL_Audio_Beat_Prompt_Schedule import FL_Audio_Beat_Prompt_Schedule
+from .nodes.audio.FL_Audio_Prompt_Envelope import FL_Audio_Beat_Prompt_Envelope, FL_Audio_Envelope_Prompt
 from .nodes.audio.FL_Audio_Beat_Visualizer import FL_Audio_Beat_Visualizer
 from .nodes.audio.FL_Audio_Crop import FL_Audio_Crop
 from .nodes.audio.FL_Audio_Drum_Detector import FL_Audio_Drum_Detector
@@ -392,6 +395,7 @@ NODE_CLASS_MAPPINGS = {
     "FL_Fal_Kontext": FL_Fal_Kontext,
     "FL_Fal_GPTImage2_Edit": FL_Fal_GPTImage2_Edit,
     "FL_Fal_Gemini_ImageEdit": FL_Fal_Gemini_ImageEdit,
+    "FL_Fal_Seedance2_ReferenceToVideo": FL_Fal_Seedance2_ReferenceToVideo,
     "FL_Fal_Seedance_i2v": FL_Fal_Seedance_i2v,
     "FL_Fal_Seedream_Edit": FL_Fal_Seedream_Edit,
     "FL_Fal_SeedVR_Upscale": FL_Fal_SeedVR_Upscale,
@@ -437,6 +441,9 @@ NODE_CLASS_MAPPINGS = {
     "FL_LTXVMaskedICLoRAGuide": FL_LTXVMaskedICLoRAGuide,
     "FL_SaveRGBAAnimatedWebP": FL_SaveRGBAAnimatedWebP,
     "FL_Audio_BPM_Analyzer": FL_Audio_BPM_Analyzer,
+    "FL_Audio_Beat_Prompt_Schedule": FL_Audio_Beat_Prompt_Schedule,
+    "FL_Audio_Beat_Prompt_Envelope": FL_Audio_Beat_Prompt_Envelope,
+    "FL_Audio_Envelope_Prompt": FL_Audio_Envelope_Prompt,
     "FL_Audio_Beat_Visualizer": FL_Audio_Beat_Visualizer,
     "FL_Audio_Crop": FL_Audio_Crop,
     "FL_Audio_Drum_Detector": FL_Audio_Drum_Detector,
@@ -596,6 +603,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_Fal_Kontext": "FL Fal Kontext API",
     "FL_Fal_GPTImage2_Edit": "FL Fal GPT-Image-2 Edit",
     "FL_Fal_Gemini_ImageEdit": "FL Fal Gemini Image Edit",
+    "FL_Fal_Seedance2_ReferenceToVideo": "FL Fal Seedance 2.0 Reference to Video",
     "FL_Fal_Seedance_i2v": "FL Fal Seedance i2v",
     "FL_Fal_Seedream_Edit": "FL Fal Seedream Edit",
     "FL_Fal_SeedVR_Upscale": "FL Fal SeedVR Upscale",
@@ -643,6 +651,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FL_LTXVMaskedICLoRAGuide": "FL LTXV Masked IC-LoRA Guide",
     "FL_SaveRGBAAnimatedWebP": "FL Save RGBA Animated WebP",
     "FL_Audio_BPM_Analyzer": "FL Audio BPM Analyzer",
+    "FL_Audio_Beat_Prompt_Schedule": "FL Audio Beat Prompt Schedule",
+    "FL_Audio_Beat_Prompt_Envelope": "FL Audio Beat Prompt Envelope",
+    "FL_Audio_Envelope_Prompt": "FL Audio Envelope Prompt",
     "FL_Audio_Beat_Visualizer": "FL Audio Beat Visualizer",
     "FL_Audio_Crop": "FL Audio Crop",
     "FL_Audio_Drum_Detector": "FL Audio Drum Detector",

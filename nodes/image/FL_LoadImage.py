@@ -142,6 +142,7 @@ def _target_dimensions(source_width, source_height, settings):
 
     width = settings["width"]
     height = settings["height"]
+
     if width == 0:
         scale = height / source_height
     elif height == 0:

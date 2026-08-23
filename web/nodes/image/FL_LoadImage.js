@@ -12,6 +12,14 @@ const MIN_NODE_WIDTH = 240;
 const MIN_NODE_HEIGHT = 230;
 const MIN_PANEL_HEIGHT = 160;
 const IMAGE_EXTENSIONS = new Set(["bmp", "gif", "jpeg", "jpg", "png", "webp"]);
+const CLIPBOARD_IMAGE_EXTENSIONS = new Map([
+  ["image/bmp", "bmp"],
+  ["image/gif", "gif"],
+  ["image/jpeg", "jpg"],
+  ["image/png", "png"],
+  ["image/webp", "webp"],
+  ["image/x-ms-bmp", "bmp"],
+]);
 
 const STYLES = `
   .flli-container {
@@ -393,6 +401,17 @@ function supportedImageFile(file) {
   return Boolean(file && IMAGE_EXTENSIONS.has(extension));
 }
 
+function clipboardImageFile(file) {
+  if (!file) return null;
+  if (supportedImageFile(file)) return file;
+  const type = String(file.type || "").toLowerCase();
+  const extension = CLIPBOARD_IMAGE_EXTENSIONS.get(type);
+  if (!extension) return null;
+  return new File([file], `image.${extension}`, {
+    type,
+    lastModified: file.lastModified || Date.now(),
+  });
+}
 class LoadImagePanel {
   constructor(node, rootWidget, legacyWidget, imageWidget, settingsWidget, container) {
     this.node = node;
@@ -460,7 +479,7 @@ class LoadImagePanel {
           <div class="flli-drop-zone" data-role="drop-zone" role="button" tabindex="0" aria-label="Choose or drop an image">
             <div class="flli-drop-icon">＋</div>
             <div class="flli-drop-title" data-role="drop-title">Drop an image here</div>
-            <div class="flli-drop-help" data-role="drop-help">or click to browse</div>
+            <div class="flli-drop-help" data-role="drop-help">or click to browse or press Ctrl+V</div>
             <div class="flli-upload-progress" data-role="upload-progress" hidden><span></span></div>
           </div>
         </div>
@@ -573,8 +592,21 @@ class LoadImagePanel {
         this.moreButton.focus();
       }
     };
+    this.handleDocumentPaste = (event) => {
+      if (event.defaultPrevented || app.canvas?.current_node !== this.node || !this.node.is_selected) return;
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target?.isContentEditable) return;
+      const item = Array.from(event.clipboardData?.items || []).find(
+        (candidate) => candidate.kind === "file" && candidate.type.toLowerCase().startsWith("image/"),
+      );
+      const file = item?.getAsFile();
+      if (!file) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void this.uploadFile(file, "clipboard");
+    };
     document.addEventListener("pointerdown", this.handleDocumentPointerDown);
     document.addEventListener("keydown", this.handleDocumentKeyDown);
+    document.addEventListener("paste", this.handleDocumentPaste, true);
 
     this.panel.addEventListener("dragenter", (event) => {
       if (!event.dataTransfer?.types?.includes("Files")) return;
@@ -624,10 +656,15 @@ class LoadImagePanel {
     button.title = hasSource ? "Replace the selected image" : "Choose an image";
   }
 
-  async uploadFile(file) {
+  async uploadFile(file, source = "file") {
+    if (source === "clipboard") file = clipboardImageFile(file);
     if (!supportedImageFile(file)) {
-      this.showError("Choose a supported image file.");
-      return;
+      this.showError(source === "clipboard" ? "Paste a supported image." : "Choose a supported image file.");
+      return false;
+    }
+    if (this.uploading) {
+      this.showError("An image upload is already in progress.");
+      return false;
     }
 
     const previousSource = this.imageWidget.value;
@@ -636,7 +673,9 @@ class LoadImagePanel {
     this.setStatus("busy", "uploading");
     this.dropZone.hidden = false;
     this.dropTitle.textContent = `Uploading ${file.name}`;
-    this.dropHelp.textContent = "Copying into ComfyUI input…";
+    this.dropHelp.textContent = source === "clipboard"
+      ? "Saving clipboard image into ComfyUI input…"
+      : "Copying into ComfyUI input…";
     this.uploadProgress.hidden = false;
     this.setObjectPreview(file);
 
@@ -644,6 +683,7 @@ class LoadImagePanel {
       const body = new FormData();
       body.append("image", file);
       body.append("type", "input");
+      if (source === "clipboard") body.append("subfolder", "pasted");
       const response = await api.fetchApi("/upload/image", { method: "POST", body });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || `Upload failed (${response.status}).`);
@@ -651,11 +691,13 @@ class LoadImagePanel {
       this.addImageOption(path);
       this.uploading = false;
       this.selectSource(path);
+      return true;
     } catch (error) {
       this.uploading = false;
       if (previousSource) this.selectSource(previousSource);
       else this.removeSource(false);
       this.showError(error.message || "Image upload failed.");
+      return false;
     } finally {
       this.uploadProgress.hidden = true;
     }
@@ -710,7 +752,7 @@ class LoadImagePanel {
     this.previewInfo.textContent = "Choose an image";
     this.browserError.hidden = true;
     this.dropTitle.textContent = "Drop an image here";
-    this.dropHelp.textContent = "or click to browse";
+    this.dropHelp.textContent = "or click to browse or press Ctrl+V";
     this.dropZone.hidden = false;
     this.setStatus("idle", "empty");
     this.syncInputImageOptions();
@@ -985,7 +1027,7 @@ class LoadImagePanel {
       return { width: settings.width, height: settings.height };
     }
     let scale;
-    if (!settings.width && !settings.height) return null;
+    if (!settings.width && !settings.height) return { width, height };
     if (!settings.width) scale = settings.height / height;
     else if (!settings.height) scale = settings.width / width;
     else scale = Math.min(settings.width / width, settings.height / height);
@@ -1106,6 +1148,7 @@ class LoadImagePanel {
     this.previewResizeObserver.disconnect();
     document.removeEventListener("pointerdown", this.handleDocumentPointerDown);
     document.removeEventListener("keydown", this.handleDocumentKeyDown);
+    document.removeEventListener("paste", this.handleDocumentPaste, true);
     this.revokeObjectUrl();
     this.image.removeAttribute("src");
     this.container.replaceChildren();
@@ -1143,6 +1186,15 @@ app.registerExtension({
     requestAnimationFrame(() => enforceMinimumNodeSize(node));
 
     const panel = new LoadImagePanel(node, rootWidget, legacyWidget, imageWidget, settingsWidget, container);
+    const originalPasteFiles = node.pasteFiles;
+    const pasteFiles = (files) => {
+      const file = Array.from(files || []).find((candidate) =>
+        supportedImageFile(candidate) || String(candidate?.type || "").toLowerCase().startsWith("image/"));
+      if (!file) return originalPasteFiles?.call(node, files) ?? false;
+      void panel.uploadFile(file, "clipboard");
+      return true;
+    };
+    node.pasteFiles = pasteFiles;
 
     const originalOnExecuted = node.onExecuted;
     node.onExecuted = function (message) {
@@ -1165,6 +1217,9 @@ app.registerExtension({
       return result;
     };
 
-    domWidget.onRemove = () => panel.dispose();
+    domWidget.onRemove = () => {
+      if (node.pasteFiles === pasteFiles) node.pasteFiles = originalPasteFiles;
+      panel.dispose();
+    };
   },
 });

@@ -1,20 +1,17 @@
 import json
-import math
 import os
 import secrets
 import threading
 from collections import OrderedDict
 from fractions import Fraction
 
-import av
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 import folder_paths
 from comfy.cli_args import args
-from comfy.model_management import InterruptProcessingException
 from comfy.utils import ProgressBar
+from comfy_api.latest import InputImpl, Types
 
 
 DEFAULT_RENDER_SETTINGS = {
@@ -205,76 +202,6 @@ def _build_metadata(prompt, extra_pnginfo, enabled):
     return metadata or None
 
 
-def _save_video(output_path, images, audio, frame_rate, bit_depth, crf, metadata):
-    frame_count = int(images.shape[0])
-    total_steps = frame_count + 1
-    progress = ProgressBar(total_steps)
-    is_10bit = bit_depth >= 10
-    pixel_format = "yuv420p10le" if is_10bit else "yuv420p"
-    frame_rate = Fraction(round(frame_rate * 1000), 1000)
-
-    try:
-        progress.update_absolute(0)
-        with av.open(
-            output_path,
-            mode="w",
-            format="mp4",
-            options={"movflags": "use_metadata_tags+faststart"},
-        ) as output:
-            if metadata is not None:
-                for key, value in metadata.items():
-                    output.metadata[key] = json.dumps(value)
-
-            video_stream = output.add_stream("h264", rate=frame_rate)
-            video_stream.width = images.shape[2]
-            video_stream.height = images.shape[1]
-            video_stream.pix_fmt = pixel_format
-            video_stream.options = {"crf": str(crf)}
-
-            audio_stream = None
-            sample_rate = None
-            waveform = None
-            audio_layout = None
-            if audio is not None:
-                sample_rate = int(audio["sample_rate"])
-                sample_count = math.ceil((sample_rate / frame_rate) * frame_count)
-                waveform = audio["waveform"][0, :, :sample_count]
-                audio_layout = {1: "mono", 2: "stereo", 6: "5.1"}[waveform.shape[0]]
-                audio_stream = output.add_stream("aac", rate=sample_rate, layout=audio_layout)
-
-            for index, image in enumerate(images, start=1):
-                if is_10bit:
-                    image = (image.float() * 65535).clamp(0, 65535).cpu().numpy().astype(np.uint16)
-                    frame = av.VideoFrame.from_ndarray(image, format="rgb48le")
-                else:
-                    image = (image * 255).clamp(0, 255).byte().cpu().numpy()
-                    frame = av.VideoFrame.from_ndarray(image, format="rgb24")
-                frame = frame.reformat(format=pixel_format)
-                output.mux(video_stream.encode(frame))
-                progress.update_absolute(index)
-
-            output.mux(video_stream.encode(None))
-
-            if audio_stream is not None:
-                frame = av.AudioFrame.from_ndarray(
-                    waveform.float().cpu().contiguous().numpy(),
-                    format="fltp",
-                    layout=audio_layout,
-                )
-                frame.sample_rate = sample_rate
-                frame.pts = 0
-                output.mux(audio_stream.encode(frame))
-                output.mux(audio_stream.encode(None))
-
-        progress.update_absolute(total_steps)
-    except (Exception, InterruptProcessingException):
-        try:
-            os.remove(output_path)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 class FL_VideoCombine:
     @classmethod
     def INPUT_TYPES(cls):
@@ -300,6 +227,7 @@ class FL_VideoCombine:
     DESCRIPTION = "Combines an image batch and optional audio into an MP4 video."
 
     def combine_video(self, images, render_settings=DEFAULT_SETTINGS_JSON, audio=None, prompt=None, extra_pnginfo=None):
+        progress = ProgressBar(100)
         settings = _parse_settings(render_settings)
         images, source_width, source_height = _prepare_images(images)
         encoded_height = int(images.shape[1])
@@ -322,16 +250,24 @@ class FL_VideoCombine:
         file = f"{filename}_{counter:05}_.mp4"
         output_path = os.path.join(full_output_folder, file)
 
-        _save_video(
+        video = InputImpl.VideoFromComponents(
+            Types.VideoComponents(
+                images=images,
+                audio=prepared_audio,
+                frame_rate=Fraction(round(settings["frame_rate"] * 1000), 1000),
+            ),
+            bit_depth=settings["bit_depth"],
+        )
+        progress.update_absolute(10)
+        video.save_to(
             output_path,
-            images,
-            prepared_audio,
-            settings["frame_rate"],
-            settings["bit_depth"],
-            settings["crf"],
-            _build_metadata(prompt, extra_pnginfo, settings["save_metadata"]),
+            format=Types.VideoContainer.MP4,
+            codec=Types.VideoCodec.H264,
+            metadata=_build_metadata(prompt, extra_pnginfo, settings["save_metadata"]),
+            crf=settings["crf"],
         )
 
+        progress.update_absolute(95)
         frame_count = int(images.shape[0])
         preview = {
             "filename": file,
@@ -350,6 +286,7 @@ class FL_VideoCombine:
         if output_type == "custom":
             token = register_preview_file(output_path)
             preview["preview_url"] = f"/fl/video-combine/preview/{token}"
+        progress.update_absolute(100)
         return {
             "ui": {"fl_video_combine": [preview]},
             "result": (output_path,),

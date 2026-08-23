@@ -1,9 +1,10 @@
 # FL_Audio_Reactive_Saturation: Control saturation based on audio envelope
 import torch
 import numpy as np
-import json
 from PIL import Image
 from typing import Tuple
+
+from .audio_envelope import load_audio_envelope
 
 
 class FL_Audio_Reactive_Saturation:
@@ -43,7 +44,7 @@ class FL_Audio_Reactive_Saturation:
         return {
             "required": {
                 "frames": ("IMAGE", {"description": "Input frames"}),
-                "envelope_json": ("STRING", {"description": "Envelope JSON from FL_Audio_Reactive_Envelope"}),
+                "envelope": ("FL_AUDIO_ENVELOPE", {"description": "Frame-aligned FL audio envelope"}),
             },
             "optional": {
                 "mask": ("IMAGE", {
@@ -74,7 +75,7 @@ class FL_Audio_Reactive_Saturation:
     def apply_saturation(
         self,
         frames: torch.Tensor,
-        envelope_json: str,
+        envelope,
         mask=None,
         base_saturation: float = 1.0,
         saturation_intensity: float = 0.2,
@@ -85,7 +86,7 @@ class FL_Audio_Reactive_Saturation:
 
         Args:
             frames: Input frames tensor (batch, height, width, channels)
-            envelope_json: JSON string with envelope data
+            envelope: Frame-aligned FL audio envelope
             base_saturation: Base saturation multiplier (1.0 = normal)
             saturation_intensity: How much envelope affects saturation
             invert: Desaturate on hits instead of saturate
@@ -93,112 +94,35 @@ class FL_Audio_Reactive_Saturation:
         Returns:
             Tuple containing saturation-adjusted frames
         """
-        print(f"\n{'='*60}")
-        print(f"[FL Audio Reactive Saturation] DEBUG: Function called")
-        print(f"[FL Audio Reactive Saturation] DEBUG: Input frames shape = {frames.shape}")
-        print(f"[FL Audio Reactive Saturation] DEBUG: Base saturation = {base_saturation}")
-        print(f"[FL Audio Reactive Saturation] DEBUG: Saturation intensity = {saturation_intensity}")
-        print(f"[FL Audio Reactive Saturation] DEBUG: Invert = {invert}")
-        print(f"{'='*60}\n")
+        envelope_values = load_audio_envelope(envelope)["values"]
+        frame_count = min(frames.shape[0], len(envelope_values))
+        frames = frames[:frame_count]
+        values = torch.tensor(
+            envelope_values[:frame_count],
+            device=frames.device,
+            dtype=frames.dtype,
+        ).view(-1, 1, 1, 1)
+        direction = -1.0 if invert else 1.0
+        saturation = (base_saturation + direction * values * saturation_intensity).clamp_min_(0.0)
+        grayscale = (
+            frames[..., 0] * 0.2126
+            + frames[..., 1] * 0.7152
+            + frames[..., 2] * 0.0722
+        ).unsqueeze(-1)
+        output = (grayscale + saturation * (frames - grayscale)).clamp(0.0, 1.0)
 
-        try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
-
-            batch_size, height, width, channels = frames.shape
-            num_envelope_frames = len(envelope)
-
-            print(f"[FL Audio Reactive Saturation] Input frames: {batch_size}")
-            print(f"[FL Audio Reactive Saturation] Envelope frames: {num_envelope_frames}")
-
-            # Handle frame count mismatch
-            if batch_size != num_envelope_frames:
-                print(f"[FL Audio Reactive Saturation] WARNING: Frame count mismatch! Using min({batch_size}, {num_envelope_frames})")
-                max_frames = min(batch_size, num_envelope_frames)
-            else:
-                max_frames = batch_size
-
-            # Prepare mask batch if provided
-            mask_images = self.prepare_mask_batch(mask, max_frames) if mask is not None else None
-
-            # Process each frame
-            output_frames = []
-
-            for frame_idx in range(max_frames):
-                # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
-
-                # Calculate saturation multiplier for this frame
-                if invert:
-                    # Invert: high envelope = desaturated
-                    saturation = base_saturation - (envelope_value * saturation_intensity)
-                else:
-                    # Normal: high envelope = more saturated
-                    saturation = base_saturation + (envelope_value * saturation_intensity)
-
-                # Clamp saturation to valid range
-                saturation = max(0.0, saturation)
-
-                # Get frame
-                frame = frames[frame_idx]
-
-                # Convert to grayscale (luminance)
-                # Using Rec. 709 luma coefficients: Y = 0.2126*R + 0.7152*G + 0.0722*B
-                grayscale = (
-                    frame[:, :, 0] * 0.2126 +
-                    frame[:, :, 1] * 0.7152 +
-                    frame[:, :, 2] * 0.0722
+        if mask is not None:
+            height, width = frames.shape[1:3]
+            mask_images = self.prepare_mask_batch(mask, frame_count)
+            mask_values = torch.stack([
+                torch.from_numpy(
+                    np.array(
+                        self.process_mask(mask_image, (width, height)),
+                        dtype=np.float32,
+                    )
                 )
-                # Expand to RGB
-                grayscale_rgb = grayscale.unsqueeze(-1).repeat(1, 1, 3)
+                for mask_image in mask_images
+            ]).div_(255.0).unsqueeze(-1).to(device=frames.device, dtype=frames.dtype)
+            output = frames * (1.0 - mask_values) + output * mask_values
 
-                # Blend between grayscale and original based on saturation
-                # saturation=0: full grayscale
-                # saturation=1: original colors
-                # saturation>1: oversaturated
-                saturated_frame = grayscale_rgb + saturation * (frame - grayscale_rgb)
-
-                # Clamp to valid range
-                saturated_frame = torch.clamp(saturated_frame, 0.0, 1.0)
-
-                # Apply mask if provided
-                if mask_images is not None:
-                    # Convert mask to tensor
-                    mask_img = self.process_mask(mask_images[frame_idx], (width, height))
-                    mask_array = np.array(mask_img).astype(np.float32) / 255.0
-
-                    # Expand mask to 3 channels
-                    if len(mask_array.shape) == 2:
-                        mask_tensor = torch.from_numpy(mask_array).unsqueeze(-1).repeat(1, 1, 3)
-                    else:
-                        mask_tensor = torch.from_numpy(mask_array)
-
-                    # Blend: mask=1.0 shows saturation effect, mask=0.0 shows original
-                    saturated_frame = frame * (1.0 - mask_tensor) + saturated_frame * mask_tensor
-
-                output_frames.append(saturated_frame)
-
-                if frame_idx % 100 == 0 or frame_idx < 5:
-                    print(f"[FL Audio Reactive Saturation] Frame {frame_idx}: envelope={envelope_value:.3f}, saturation={saturation:.3f}")
-
-            # Stack all frames
-            output_tensor = torch.stack(output_frames, dim=0)
-
-            print(f"\n{'='*60}")
-            print(f"[FL Audio Reactive Saturation] Processing complete!")
-            print(f"[FL Audio Reactive Saturation] Output frames: {output_tensor.shape[0]}")
-            print(f"[FL Audio Reactive Saturation] Output shape: {output_tensor.shape}")
-            print(f"[FL Audio Reactive Saturation] Value range: [{output_tensor.min():.3f}, {output_tensor.max():.3f}]")
-            print(f"{'='*60}\n")
-
-            return (output_tensor,)
-
-        except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            print(f"\n{'='*60}")
-            print(f"[FL Audio Reactive Saturation] ERROR: {error_msg}")
-            import traceback
-            traceback.print_exc()
-            print(f"{'='*60}\n")
-            return (frames,)
+        return (output,)

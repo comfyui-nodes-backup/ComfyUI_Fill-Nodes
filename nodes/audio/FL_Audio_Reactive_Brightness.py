@@ -1,9 +1,10 @@
 # FL_Audio_Reactive_Brightness: Control brightness/luminance based on audio envelope
 import torch
 import numpy as np
-import json
 from PIL import Image
 from typing import Tuple
+
+from .audio_envelope import load_audio_envelope
 
 
 class FL_Audio_Reactive_Brightness:
@@ -43,7 +44,7 @@ class FL_Audio_Reactive_Brightness:
         return {
             "required": {
                 "frames": ("IMAGE", {"description": "Input frames"}),
-                "envelope_json": ("STRING", {"description": "Envelope JSON from FL_Audio_Reactive_Envelope"}),
+                "envelope": ("FL_AUDIO_ENVELOPE", {"description": "Frame-aligned FL audio envelope"}),
             },
             "optional": {
                 "mask": ("IMAGE", {
@@ -78,7 +79,7 @@ class FL_Audio_Reactive_Brightness:
     def apply_brightness(
         self,
         frames: torch.Tensor,
-        envelope_json: str,
+        envelope,
         mask=None,
         base_brightness: float = 1.0,
         brightness_intensity: float = 0.15,
@@ -90,7 +91,7 @@ class FL_Audio_Reactive_Brightness:
 
         Args:
             frames: Input frames tensor (batch, height, width, channels)
-            envelope_json: JSON string with envelope data
+            envelope: Frame-aligned FL audio envelope
             base_brightness: Base brightness multiplier (1.0 = normal)
             brightness_intensity: How much envelope affects brightness
             invert: Darken on hits instead of brighten
@@ -99,98 +100,32 @@ class FL_Audio_Reactive_Brightness:
         Returns:
             Tuple containing brightness-adjusted frames
         """
-        print(f"\n{'='*60}")
-        print(f"[FL Audio Reactive Brightness] DEBUG: Function called")
-        print(f"[FL Audio Reactive Brightness] DEBUG: Input frames shape = {frames.shape}")
-        print(f"[FL Audio Reactive Brightness] DEBUG: Base brightness = {base_brightness}")
-        print(f"[FL Audio Reactive Brightness] DEBUG: Brightness intensity = {brightness_intensity}")
-        print(f"[FL Audio Reactive Brightness] DEBUG: Invert = {invert}")
-        print(f"[FL Audio Reactive Brightness] DEBUG: Clamp output = {clamp_output}")
-        print(f"{'='*60}\n")
+        envelope_values = load_audio_envelope(envelope)["values"]
+        frame_count = min(frames.shape[0], len(envelope_values))
+        frames = frames[:frame_count]
+        values = torch.tensor(
+            envelope_values[:frame_count],
+            device=frames.device,
+            dtype=frames.dtype,
+        ).view(-1, 1, 1, 1)
+        direction = -1.0 if invert else 1.0
+        brightness = base_brightness + direction * values * brightness_intensity
+        output = frames * brightness
+        if clamp_output:
+            output = output.clamp(0.0, 1.0)
 
-        try:
-            # Parse envelope JSON
-            envelope_data = json.loads(envelope_json)
-            envelope = envelope_data['envelope']
+        if mask is not None:
+            height, width = frames.shape[1:3]
+            mask_images = self.prepare_mask_batch(mask, frame_count)
+            mask_values = torch.stack([
+                torch.from_numpy(
+                    np.array(
+                        self.process_mask(mask_image, (width, height)),
+                        dtype=np.float32,
+                    )
+                )
+                for mask_image in mask_images
+            ]).div_(255.0).unsqueeze(-1).to(device=frames.device, dtype=frames.dtype)
+            output = frames * (1.0 - mask_values) + output * mask_values
 
-            batch_size, height, width, channels = frames.shape
-            num_envelope_frames = len(envelope)
-
-            print(f"[FL Audio Reactive Brightness] Input frames: {batch_size}")
-            print(f"[FL Audio Reactive Brightness] Envelope frames: {num_envelope_frames}")
-
-            # Handle frame count mismatch
-            if batch_size != num_envelope_frames:
-                print(f"[FL Audio Reactive Brightness] WARNING: Frame count mismatch! Using min({batch_size}, {num_envelope_frames})")
-                max_frames = min(batch_size, num_envelope_frames)
-            else:
-                max_frames = batch_size
-
-            # Prepare mask batch if provided
-            mask_images = self.prepare_mask_batch(mask, max_frames) if mask is not None else None
-
-            # Process each frame
-            output_frames = []
-
-            for frame_idx in range(max_frames):
-                # Get envelope value for this frame
-                envelope_value = envelope[frame_idx]
-
-                # Calculate brightness multiplier for this frame
-                if invert:
-                    # Invert: high envelope = darker
-                    brightness = base_brightness - (envelope_value * brightness_intensity)
-                else:
-                    # Normal: high envelope = brighter
-                    brightness = base_brightness + (envelope_value * brightness_intensity)
-
-                # Get frame
-                frame = frames[frame_idx]
-
-                # Apply brightness multiplier
-                brightened_frame = frame * brightness
-
-                # Clamp to valid range if requested
-                if clamp_output:
-                    brightened_frame = torch.clamp(brightened_frame, 0.0, 1.0)
-
-                # Apply mask if provided
-                if mask_images is not None:
-                    # Convert mask to tensor
-                    mask_img = self.process_mask(mask_images[frame_idx], (width, height))
-                    mask_array = np.array(mask_img).astype(np.float32) / 255.0
-
-                    # Expand mask to 3 channels
-                    if len(mask_array.shape) == 2:
-                        mask_tensor = torch.from_numpy(mask_array).unsqueeze(-1).repeat(1, 1, 3)
-                    else:
-                        mask_tensor = torch.from_numpy(mask_array)
-
-                    # Blend: mask=1.0 shows brightness effect, mask=0.0 shows original
-                    brightened_frame = frame * (1.0 - mask_tensor) + brightened_frame * mask_tensor
-
-                output_frames.append(brightened_frame)
-
-                if frame_idx % 100 == 0 or frame_idx < 5:
-                    print(f"[FL Audio Reactive Brightness] Frame {frame_idx}: envelope={envelope_value:.3f}, brightness={brightness:.3f}")
-
-            # Stack all frames
-            output_tensor = torch.stack(output_frames, dim=0)
-
-            print(f"\n{'='*60}")
-            print(f"[FL Audio Reactive Brightness] Processing complete!")
-            print(f"[FL Audio Reactive Brightness] Output frames: {output_tensor.shape[0]}")
-            print(f"[FL Audio Reactive Brightness] Output shape: {output_tensor.shape}")
-            print(f"[FL Audio Reactive Brightness] Value range: [{output_tensor.min():.3f}, {output_tensor.max():.3f}]")
-            print(f"{'='*60}\n")
-
-            return (output_tensor,)
-
-        except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            print(f"\n{'='*60}")
-            print(f"[FL Audio Reactive Brightness] ERROR: {error_msg}")
-            import traceback
-            traceback.print_exc()
-            print(f"{'='*60}\n")
-            return (frames,)
+        return (output,)

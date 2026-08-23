@@ -1,7 +1,42 @@
 # FL_Audio_BPM_Analyzer: Analyze audio and detect all beats
-import torch
-import numpy as np
+import json
+import math
 from typing import Tuple, Dict, Any
+
+import numpy as np
+import torch
+
+
+_WAVEFORM_BUCKETS_PER_SECOND = 60
+_MAX_WAVEFORM_BUCKETS = 4096
+_WAVEFORM_SCALE = 32767
+
+
+def _waveform_preview(waveform, sample_rate):
+    sample_count = len(waveform)
+    duration = sample_count / sample_rate
+    bucket_count = min(
+        sample_count,
+        _MAX_WAVEFORM_BUCKETS,
+        max(1, math.ceil(duration * _WAVEFORM_BUCKETS_PER_SECOND)),
+    )
+    starts = np.linspace(0, sample_count, bucket_count + 1, dtype=np.int64)[:-1]
+    minimums = np.minimum.reduceat(waveform, starts)
+    maximums = np.maximum.reduceat(waveform, starts)
+    peak = max(float(np.abs(minimums).max()), float(np.abs(maximums).max()))
+    if peak > 0:
+        minimums = minimums / peak
+        maximums = maximums / peak
+
+    peaks = np.empty(bucket_count * 2, dtype=np.int16)
+    peaks[0::2] = np.rint(minimums * _WAVEFORM_SCALE).astype(np.int16)
+    peaks[1::2] = np.rint(maximums * _WAVEFORM_SCALE).astype(np.int16)
+    return {
+        "version": 1,
+        "duration": float(duration),
+        "scale": _WAVEFORM_SCALE,
+        "peaks": peaks.tolist(),
+    }
 
 
 class FL_Audio_BPM_Analyzer:
@@ -22,10 +57,6 @@ class FL_Audio_BPM_Analyzer:
                 "audio": ("AUDIO", {"description": "Input audio tensor"}),
             },
             "optional": {
-                "bpm_method": (["beat_intervals", "onset_strength"], {
-                    "default": "beat_intervals",
-                    "description": "BPM calculation: beat_intervals (accurate) or onset_strength (librosa default)"
-                }),
                 "half_time": ("BOOLEAN", {
                     "default": False,
                     "description": "Half the detected BPM (for songs detected at double-time)"
@@ -40,13 +71,12 @@ class FL_Audio_BPM_Analyzer:
             }
         }
 
-    def analyze_beats(self, audio: Dict[str, Any], bpm_method: str = "beat_intervals", half_time: bool = False, beat_offset_ms: int = 0) -> Tuple[Dict[str, Any], float, str, torch.Tensor]:
+    def analyze_beats(self, audio: Dict[str, Any], half_time: bool = False, beat_offset_ms: int = 0) -> Tuple[Dict[str, Any], float, str, torch.Tensor]:
         """
         Analyze audio and detect all beats
 
         Args:
             audio: Input audio tensor dict with 'waveform' and 'sample_rate'
-            bpm_method: BPM calculation method ("beat_intervals" or "onset_strength")
             half_time: Half the detected BPM (for songs detected at double-time)
             beat_offset_ms: Offset in milliseconds to shift all beat positions (positive or negative)
 
@@ -55,7 +85,6 @@ class FL_Audio_BPM_Analyzer:
         """
         print(f"\n{'='*60}")
         print(f"[FL BPM Analyzer] DEBUG: Function called")
-        print(f"[FL BPM Analyzer] DEBUG: BPM method = {bpm_method}")
         print(f"[FL BPM Analyzer] DEBUG: Audio input type = {type(audio)}")
         print(f"{'='*60}\n")
 
@@ -120,11 +149,11 @@ class FL_Audio_BPM_Analyzer:
             # Handle tempo output (can be array or scalar)
             if isinstance(tempo, np.ndarray):
                 if len(tempo) > 0:
-                    onset_strength_bpm = float(tempo[0])
+                    tracked_bpm = float(tempo[0])
                 else:
-                    onset_strength_bpm = 0.0
+                    tracked_bpm = 0.0
             else:
-                onset_strength_bpm = float(tempo)
+                tracked_bpm = float(tempo)
 
             # Convert beat frames to time
             beat_times = librosa.frames_to_time(beat_frames, sr=sample_rate)
@@ -135,28 +164,20 @@ class FL_Audio_BPM_Analyzer:
             # Calculate beat intervals and BPM from actual beats
             if len(beat_times) > 1:
                 beat_intervals = np.diff(beat_times)
-                avg_interval = np.mean(beat_intervals)
                 median_interval = np.median(beat_intervals)
 
                 # Calculate BPM from beat intervals
-                beat_interval_bpm = 60.0 / avg_interval
                 median_bpm = 60.0 / median_interval
 
-                print(f"[FL BPM Analyzer] DEBUG: Onset strength BPM = {onset_strength_bpm:.2f}")
                 print(f"[FL BPM Analyzer] DEBUG: Beat interval BPM (median) = {median_bpm:.2f}")
 
-                # Choose BPM based on method
-                if bpm_method == "beat_intervals":
-                    bpm = median_bpm
-                    bpm_source = "beat_intervals_median"
-                else:
-                    bpm = onset_strength_bpm
-                    bpm_source = "onset_strength"
+                bpm = median_bpm
+                bpm_source = "beat_intervals_median"
 
                 print(f"[FL BPM Analyzer] DEBUG: Using {bpm_source}: {bpm:.2f} BPM")
             else:
-                bpm = onset_strength_bpm
-                bpm_source = "onset_strength"
+                bpm = tracked_bpm
+                bpm_source = "librosa_tempo_fallback"
                 beat_intervals = np.array([])
                 median_interval = 60.0 / bpm if bpm > 0 else 0.5
 
@@ -237,7 +258,6 @@ class FL_Audio_BPM_Analyzer:
                 beat_times = np.clip(beat_times, 0, audio_duration)
 
             # Format beat positions as JSON
-            import json
             beat_positions_dict = {
                 "bpm": float(bpm),
                 "bpm_source": bpm_source,
@@ -245,7 +265,8 @@ class FL_Audio_BPM_Analyzer:
                 "beat_frames": beat_frames.tolist(),
                 "num_beats": len(beat_times),
                 "sample_rate": int(sample_rate),
-                "audio_duration": float(len(waveform_np) / sample_rate)
+                "audio_duration": float(len(waveform_np) / sample_rate),
+                "waveform_preview": _waveform_preview(waveform_np, sample_rate),
             }
 
             beat_positions_json = json.dumps(beat_positions_dict, indent=2)
