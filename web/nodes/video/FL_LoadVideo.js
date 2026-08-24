@@ -1,5 +1,6 @@
 import { app } from "../../../../scripts/app.js";
 import { api } from "../../../../scripts/api.js";
+import { addCanvasNavigation } from "./canvas_navigation.js";
 
 const DEFAULT_SETTINGS = {
   version: 1,
@@ -1871,6 +1872,7 @@ app.registerExtension({
     container.style.height = "100%";
     container.style.minHeight = `${MIN_PANEL_HEIGHT}px`;
     container.style.overflow = "hidden";
+    addCanvasNavigation(container, app.canvas);
 
     const domWidget = node.addDOMWidget("fl_load_video_panel", "fl-load-video", container, {
       getMinHeight: () => MIN_PANEL_HEIGHT,
